@@ -65,3 +65,11 @@ while holding the Server lock, but the Server lock must not be acquired while
 holding eventIdsMu.
 
     Server -> eventIdsMu
+
+The "catchupGate.mu" lock protects the per-source/mirror catch-up budget state
+machine (window counters, pause, parked flow control). It is a leaf lock: the
+gate never acquires stream/server/client locks and never sends while holding
+it. The sync processing loops may take the stream lock while holding no gate
+lock; gate methods used under the stream lock are short and never call back.
+
+    stream -> catchupGate

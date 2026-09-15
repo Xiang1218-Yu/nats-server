@@ -139,12 +139,20 @@ func (cfg *StreamConfig) clone() *StreamConfig {
 	}
 	if cfg.Mirror != nil {
 		mirror := *cfg.Mirror
+		if cfg.Mirror.CatchUpBudget != nil {
+			budget := *cfg.Mirror.CatchUpBudget
+			mirror.CatchUpBudget = &budget
+		}
 		clone.Mirror = &mirror
 	}
 	if len(cfg.Sources) > 0 {
 		clone.Sources = make([]*StreamSource, len(cfg.Sources))
 		for i, cfgSource := range cfg.Sources {
 			source := *cfgSource
+			if cfgSource.CatchUpBudget != nil {
+				budget := *cfgSource.CatchUpBudget
+				source.CatchUpBudget = &budget
+			}
 			clone.Sources[i] = &source
 		}
 	}
@@ -479,6 +487,9 @@ type StreamSourceInfo struct {
 	Error             *ApiError                `json:"error,omitempty"`
 	FilterSubject     string                   `json:"filter_subject,omitempty"`
 	SubjectTransforms []SubjectTransformConfig `json:"subject_transforms,omitempty"`
+	// CatchUp reports the catch-up budget state when a catchup_budget is
+	// configured for this mirror/source.
+	CatchUp *CatchUpStatus `json:"catchup,omitempty"`
 }
 
 // StreamSource dictates how streams can source from other streams.
@@ -491,8 +502,93 @@ type StreamSource struct {
 	External          *ExternalStream          `json:"external,omitempty"`
 	Consumer          *StreamConsumerSource    `json:"consumer,omitempty"`
 
+	// CatchUpBudget optionally limits how quickly this mirror/source is
+	// allowed to catch up a backlog. When nil (or an all-zero budget) the
+	// legacy, unthrottled behavior is preserved.
+	CatchUpBudget *CatchUpBudget `json:"catchup_budget,omitempty"`
+
 	// Internal
 	iname string // For indexing when stream names are the same for multiple sources.
+}
+
+// CatchUpBudget limits the rate at which a mirror or a source catches up
+// messages it is lagging behind. Only messages delivered while the stream is
+// lagging behind CatchUpBudget.LagThreshold count against the budget; once the
+// backlog drains, synchronization is treated as real-time and is never
+// throttled.
+//
+// All limits are independent: setting MaxMsgs only limits the number of
+// messages, setting MaxBytes only limits the payload volume, etc. An
+// all-zero CatchUpBudget disables catch-up rate limiting entirely.
+type CatchUpBudget struct {
+	// Window is the time unit the message and byte limits are applied over.
+	// Defaults to one second when any limit is set.
+	Window time.Duration `json:"window,omitempty"`
+	// MaxMsgs is the maximum number of catch-up messages that may be applied
+	// per Window. 0 means no message limit.
+	MaxMsgs int64 `json:"max_msgs,omitempty"`
+	// MaxBytes is the maximum total payload size (in bytes) of catch-up
+	// messages that may be applied per Window. 0 means no byte limit.
+	MaxBytes int64 `json:"max_bytes,omitempty"`
+	// MaxConcurrent caps the number of catch-up messages that may be in
+	// flight (pulled from the origin but not yet applied locally) before the
+	// next flow control window is released. 0 means no in-flight limit.
+	MaxConcurrent int `json:"max_concurrent,omitempty"`
+	// MaxDuration caps how long a continuous catch-up burst may run before a
+	// pause is enforced. 0 means no duration limit.
+	MaxDuration time.Duration `json:"max_duration,omitempty"`
+	// PauseDuration is how long catch-up pauses once MaxDuration has been
+	// reached. Defaults to Window.
+	PauseDuration time.Duration `json:"pause_duration,omitempty"`
+	// LagThreshold classifies traffic: a message whose lag is greater than
+	// this value counts as catch-up traffic, otherwise synchronization is
+	// considered real-time. Defaults to dgetCaughtUpThresh.
+	LagThreshold uint64 `json:"lag_threshold,omitempty"`
+}
+
+// enabled reports whether the budget, as provided by the user, sets any limit.
+func (cb *CatchUpBudget) enabled() bool {
+	return cb != nil && (cb.MaxMsgs > 0 || cb.MaxBytes > 0 || cb.MaxConcurrent > 0 || cb.MaxDuration > 0)
+}
+
+// normalize validates the catch-up budget and applies default values. A nil
+// budget, or one that sets no limit, normalizes to nil (feature disabled).
+func (cb *CatchUpBudget) normalize() (*CatchUpBudget, *ApiError) {
+	if cb == nil {
+		return nil, nil
+	}
+	if cb.Window < 0 || cb.PauseDuration < 0 || cb.MaxDuration < 0 ||
+		cb.MaxMsgs < 0 || cb.MaxBytes < 0 || cb.MaxConcurrent < 0 || cb.LagThreshold < 0 {
+		return nil, NewJSStreamInvalidConfigError(fmt.Errorf("catchup budget values can not be negative"))
+	}
+	if !cb.enabled() {
+		return nil, nil
+	}
+	n := *cb
+	if n.Window == 0 {
+		n.Window = time.Second
+	}
+	if n.PauseDuration == 0 {
+		n.PauseDuration = n.Window
+	}
+	if n.LagThreshold == 0 {
+		n.LagThreshold = dgetCaughtUpThresh
+	}
+	return &n, nil
+}
+
+// normalizeSourceCatchUpBudget validates the budget of a mirror/source
+// definition and rejects the combination of a budget with an externally owned
+// sourcing consumer, whose flow control this server does not control.
+func normalizeSourceCatchUpBudget(ss *StreamSource) (*CatchUpBudget, *ApiError) {
+	ncb, apiErr := ss.CatchUpBudget.normalize()
+	if apiErr != nil {
+		return nil, apiErr
+	}
+	if ncb != nil && ss.Consumer != nil {
+		return nil, NewJSStreamInvalidConfigError(fmt.Errorf("catchup budget can not be combined with an external sourcing consumer"))
+	}
+	return ncb, nil
 }
 
 // StreamConsumerSource dictates a durable consumer with a specific name is used for sourcing.
@@ -722,6 +818,10 @@ type sourceInfo struct {
 	sf    string              // The subject filter.
 	sfs   []string            // The subject filters.
 	trs   []*subjectTransform // The subject transforms.
+
+	// gate is the optional catch-up budget gate. nil when no budget is
+	// configured, in which case the legacy sync behavior is preserved.
+	gate *catchupGate
 }
 
 // For mirrors and direct get
@@ -2117,6 +2217,16 @@ func (s *Server) checkStreamCfgLocked(config *StreamConfig, acc *Account, pedant
 
 	// Do some pre-checking for mirror config to avoid cycles in clustered mode.
 	if cfg.Mirror != nil {
+		// Validate and normalize the optional catch-up budget. Catch-up
+		// budgets cannot be combined with externally owned sourcing
+		// consumers, whose flow control is not managed by this server.
+		if ncb, apiErr := normalizeSourceCatchUpBudget(cfg.Mirror); apiErr != nil {
+			return StreamConfig{}, apiErr
+		} else if ncb != nil {
+			mirror := *cfg.Mirror
+			mirror.CatchUpBudget = ncb
+			cfg.Mirror = &mirror
+		}
 		if cfg.FirstSeq > 0 {
 			return StreamConfig{}, NewJSMirrorWithFirstSeqError()
 		}
@@ -2229,9 +2339,18 @@ func (s *Server) checkStreamCfgLocked(config *StreamConfig, acc *Account, pedant
 	// check sources for duplicates
 	var iNames = make(map[string]struct{})
 	var cNames = make(map[string]struct{})
-	for _, src := range cfg.Sources {
+	for idx, src := range cfg.Sources {
 		if src == nil || !isValidAssetName(src.Name) {
 			return StreamConfig{}, NewJSSourceInvalidStreamNameError()
+		}
+		// Validate and normalize the optional catch-up budget.
+		if ncb, apiErr := normalizeSourceCatchUpBudget(src); apiErr != nil {
+			return StreamConfig{}, apiErr
+		} else if ncb != nil {
+			nsrc := *src
+			nsrc.CatchUpBudget = ncb
+			src = &nsrc
+			cfg.Sources[idx] = src
 		}
 		if _, ok := iNames[src.composeIName()]; !ok {
 			iNames[src.composeIName()] = struct{}{}
@@ -2813,9 +2932,9 @@ func (mset *stream) updateWithAdvisory(config *StreamConfig, sendAdvisory bool, 
 					var si *sourceInfo
 
 					if len(s.SubjectTransforms) == 0 {
-						si = &sourceInfo{name: s.Name, iname: s.iname, sf: s.FilterSubject}
+						si = &sourceInfo{name: s.Name, iname: s.iname, sf: s.FilterSubject, gate: newCatchUpGate(s.CatchUpBudget)}
 					} else {
-						si = &sourceInfo{name: s.Name, iname: s.iname}
+						si = &sourceInfo{name: s.Name, iname: s.iname, gate: newCatchUpGate(s.CatchUpBudget)}
 						si.trs = make([]*subjectTransform, len(s.SubjectTransforms))
 						si.sfs = make([]string, len(s.SubjectTransforms))
 						for i := range s.SubjectTransforms {
@@ -3316,6 +3435,9 @@ func (mset *stream) sourceInfo(si *sourceInfo) *StreamSourceInfo {
 			DeliverPrefix: ext.DeliverPrefix,
 		}
 	}
+	if si.gate != nil {
+		ssi.CatchUp = si.gate.snapshot()
+	}
 	return &ssi
 }
 
@@ -3417,43 +3539,82 @@ func (mset *stream) processMirrorMsgs(mirror *sourceInfo, ready *sync.WaitGroup)
 	t := time.NewTicker(sourceHealthCheckInterval)
 	defer t.Stop()
 
+	// Retained batch while the mirror catch-up gate is paused.
+	var batch []*inMsg
+	var batchIdx int
+	var wait *catchupGate
+	awaitResume := false
+
 	for {
-		select {
-		case <-s.quitCh:
-			return
-		case <-qch:
-			return
-		case <-siqch:
-			return
-		case <-msgs.ch:
-			ims := msgs.pop()
-			for _, im := range ims {
-				if !mset.processInboundMirrorMsg(im) {
-					break
-				}
-				im.returnToPool()
-			}
-			msgs.recycle(&ims)
-		case <-t.C:
-			mset.mu.RLock()
-			var stalled bool
-			if mset.mirror != nil {
-				stalled = time.Since(time.Unix(0, mset.mirror.last.Load())) > sourceHealthCheckInterval
-			}
-			isLeader := mset.isLeader()
-			mset.mu.RUnlock()
-			// No longer leader.
-			if !isLeader {
-				mset.mu.Lock()
-				mset.cancelMirrorConsumer()
-				mset.mu.Unlock()
+		if wait != nil {
+			select {
+			case <-s.quitCh:
 				return
+			case <-qch:
+				return
+			case <-siqch:
+				return
+			case <-wait.wakeCh():
+				if awaitResume && !wait.snapshot().Paused {
+					mset.logCatchUpResumed("mirror", mirror.name)
+					awaitResume = false
+				}
 			}
-			// We are stalled.
-			if stalled {
-				mset.retryMirrorConsumer()
+			wait = nil
+		} else {
+			select {
+			case <-s.quitCh:
+				return
+			case <-qch:
+				return
+			case <-siqch:
+				return
+			case <-msgs.ch:
+				batch = msgs.pop()
+				batchIdx = 0
+			case <-t.C:
+				mset.mu.RLock()
+				var stalled bool
+				if mset.mirror != nil {
+					stalled = time.Since(time.Unix(0, mset.mirror.last.Load())) > sourceHealthCheckInterval
+				}
+				isLeader := mset.isLeader()
+				mset.mu.RUnlock()
+				// No longer leader.
+				if !isLeader {
+					mset.mu.Lock()
+					mset.cancelMirrorConsumer()
+					mset.mu.Unlock()
+					return
+				}
+				// We are stalled.
+				if stalled {
+					mset.retryMirrorConsumer()
+				}
+				continue
 			}
 		}
+
+		g, at, stop := mset.processMirrorBatch(mirror, batch, batchIdx)
+		if stop {
+			// Recycle through a fresh local: ipQueue pools the *slice
+			// pointer, so it must not alias the reused batch variable.
+			done := batch
+			msgs.recycle(&done)
+			batch, batchIdx, wait = nil, 0, nil
+			continue
+		}
+		if g != nil {
+			if !awaitResume {
+				mset.logCatchUpPaused("mirror", mirror.name, g.snapshot())
+				awaitResume = true
+			}
+			wait, batchIdx = g, at
+			continue
+		}
+		done := batch
+		msgs.recycle(&done)
+		batch, batchIdx, wait = nil, 0, nil
 	}
 }
 
@@ -4085,6 +4246,12 @@ func (mset *stream) setupMirrorConsumer() error {
 				}
 				mset.queueInbound(msgs, subject, reply, hdr, msg, nil, nil)
 				mirror.last.Store(time.Now().UnixNano())
+				// Feed the catch-up budget gate with data deliveries only;
+				// control messages (FC/heartbeats) carry no ACK pending.
+				if mirror.gate != nil && len(msg) > 0 {
+					_, _, _, _, pending := ackReplyInfo(reply)
+					mirror.gate.delivered(pending)
+				}
 			})
 			if err != nil {
 				mirror.err = NewJSMirrorConsumerSetupFailedError(err, Unless(err))
@@ -4190,6 +4357,12 @@ func (mset *stream) cancelSourceInfo(si *sourceInfo) {
 	if si.sub != nil {
 		mset.unsubscribe(si.sub)
 		si.sub = nil
+	}
+	// A recreated consumer invalidates any flow control request we may have
+	// withheld from the previous one. The gate itself outlives consumer
+	// recreations and is stopped with the sourceInfo.
+	if si.gate != nil {
+		si.gate.clearFC()
 	}
 	mset.removeInternalConsumer(si)
 	if si.qch != nil {
@@ -4650,6 +4823,12 @@ func (mset *stream) trySetupSourceConsumer(iname string, seq uint64, startTime t
 					hdr, msg := c.msgParts(copyBytes(rmsg)) // Need to copy.
 					mset.queueInbound(msgs, subject, reply, hdr, msg, si, nil)
 					si.last.Store(time.Now().UnixNano())
+					// Feed the catch-up budget gate with data deliveries only;
+					// control messages (FC/heartbeats) carry no ACK pending.
+					if si.gate != nil && len(msg) > 0 {
+						_, _, _, _, pending := ackReplyInfo(reply)
+						si.gate.delivered(pending)
+					}
 				})
 				if err != nil {
 					si.err = NewJSSourceConsumerSetupFailedError(err, Unless(err))
@@ -4667,6 +4846,78 @@ func (mset *stream) trySetupSourceConsumer(iname string, seq uint64, startTime t
 			retry, timedOut = true, true
 		}
 	}()
+}
+
+// processSourceBatch applies catch-up gating while dispatching a popped batch
+// of inbound source messages starting at idx. Every dispatched message is
+// returned to its pool. It returns a non-nil gate and the retained index when
+// a gate pauses and the caller must wait on the gate's wake channel before
+// invoking again with the same slice and index; stop mirrors the previous
+// "handler returned false" semantics.
+func (mset *stream) processSourceBatch(ims []*inMsg, idx int) (wait *catchupGate, at int, stop bool) {
+	gates := make(map[*catchupGate]*sourceInfo)
+	for i := idx; i < len(ims); i++ {
+		im := ims[i]
+		si := im.si
+		gate := si.gate
+		if gate != nil {
+			gates[gate] = si
+			if mset.gateControlMessage(gate, im) {
+				im.returnToPool()
+				continue
+			}
+			_, _, _, _, pending := ackReplyInfo(im.rply)
+			lag := lagFromPending(pending)
+			if ok, _ := gate.admit(lag, int64(len(im.msg))); !ok {
+				return gate, i, false
+			}
+		}
+		if !mset.processInboundSourceMsg(si, im) {
+			return nil, i, true
+		}
+		if gate != nil {
+			_, _, _, _, pending := ackReplyInfo(im.rply)
+			gate.applied(gate.isCatchup(lagFromPending(pending)))
+			mset.releaseParkedSourceFC(si)
+		}
+		im.returnToPool()
+	}
+	// A flow control parked at the tail of the batch may be releasable now
+	// that all its messages drained.
+	for _, si := range gates {
+		mset.releaseParkedSourceFC(si)
+	}
+	return nil, len(ims), false
+}
+
+// processMirrorBatch is the mirror equivalent of processSourceBatch.
+func (mset *stream) processMirrorBatch(mirror *sourceInfo, ims []*inMsg, idx int) (wait *catchupGate, at int, stop bool) {
+	gate := mirror.gate
+	for i := idx; i < len(ims); i++ {
+		im := ims[i]
+		if gate != nil {
+			if mset.gateControlMessage(gate, im) {
+				im.returnToPool()
+				continue
+			}
+			_, _, _, _, pending := ackReplyInfo(im.rply)
+			lag := lagFromPending(pending)
+			if ok, _ := gate.admit(lag, int64(len(im.msg))); !ok {
+				return gate, i, false
+			}
+		}
+		if !mset.processInboundMirrorMsg(im) {
+			return nil, i, true
+		}
+		if gate != nil {
+			_, _, _, _, pending := ackReplyInfo(im.rply)
+			gate.applied(gate.isCatchup(lagFromPending(pending)))
+			mset.releaseParkedMirrorFC(mirror)
+		}
+		im.returnToPool()
+	}
+	mset.releaseParkedMirrorFC(mirror)
+	return nil, len(ims), false
 }
 
 // This will process all inbound source msgs.
@@ -4689,6 +4940,9 @@ func (mset *stream) processAllSourceMsgs() {
 		mset.mu.Lock()
 		defer mset.mu.Unlock()
 		for _, si := range mset.sources {
+			if si.gate != nil {
+				si.gate.stop()
+			}
 			mset.cancelSourceConsumer(si.iname)
 		}
 		mset.smsgs.drain()
@@ -4696,62 +4950,101 @@ func (mset *stream) processAllSourceMsgs() {
 		mset.smsgs = nil
 	}
 
+	// Retained batch while a catch-up gate is paused. Gates present in this
+	// map have logged a pause and are awaiting a resume log line.
+	var batch []*inMsg
+	var batchIdx int
+	var wait *catchupGate
+	awaitResume := make(map[*catchupGate]*sourceInfo)
+
 	for {
-		select {
-		case <-s.quitCh:
-			return
-		case <-qch:
-			return
-		case <-msgs.ch:
-			ims := msgs.pop()
-			for _, im := range ims {
-				if !mset.processInboundSourceMsg(im.si, im) {
-					// If we are no longer leader bail.
-					if !mset.IsLeader() {
-						msgs.recycle(&ims)
-						cleanUp()
-						return
-					}
-					break
-				}
-				im.returnToPool()
-			}
-			msgs.recycle(&ims)
-		case <-t.C:
-			// If we are no longer leader bail.
-			if !mset.IsLeader() {
-				cleanUp()
+		if wait != nil {
+			select {
+			case <-s.quitCh:
 				return
-			}
-
-			// Check health of all sources.
-			var stalled []*sourceInfo
-			mset.mu.RLock()
-			for _, si := range mset.sources {
-				if time.Since(time.Unix(0, si.last.Load())) > sourceHealthCheckInterval {
-					stalled = append(stalled, si)
+			case <-qch:
+				return
+			case <-wait.wakeCh():
+				if si, ok := awaitResume[wait]; ok && !wait.snapshot().Paused {
+					mset.logCatchUpResumed("source", si.name)
+					delete(awaitResume, wait)
 				}
 			}
-			numSources := len(mset.sources)
-			mset.mu.RUnlock()
-
-			// This can happen on an update when no longer have sources.
-			if numSources == 0 {
-				cleanUp()
+			wait = nil
+		} else {
+			select {
+			case <-s.quitCh:
 				return
-			}
+			case <-qch:
+				return
+			case <-msgs.ch:
+				batch = msgs.pop()
+				batchIdx = 0
+			case <-t.C:
+				// If we are no longer leader bail.
+				if !mset.IsLeader() {
+					cleanUp()
+					return
+				}
 
-			// We do not want to block here so do in separate Go routine.
-			if len(stalled) > 0 {
-				go func() {
-					mset.mu.Lock()
-					defer mset.mu.Unlock()
-					for _, si := range stalled {
-						mset.setupSourceConsumer(si.iname, si.sseq+1, time.Time{})
+				// Check health of all sources.
+				var stalled []*sourceInfo
+				mset.mu.RLock()
+				for _, si := range mset.sources {
+					if time.Since(time.Unix(0, si.last.Load())) > sourceHealthCheckInterval {
+						stalled = append(stalled, si)
 					}
-				}()
+				}
+				numSources := len(mset.sources)
+				mset.mu.RUnlock()
+
+				// This can happen on an update when no longer have sources.
+				if numSources == 0 {
+					cleanUp()
+					return
+				}
+
+				// We do not want to block here so do in separate Go routine.
+				if len(stalled) > 0 {
+					go func() {
+						mset.mu.Lock()
+						defer mset.mu.Unlock()
+						for _, si := range stalled {
+							mset.setupSourceConsumer(si.iname, si.sseq+1, time.Time{})
+						}
+					}()
+				}
+				continue
 			}
 		}
+
+		g, at, stop := mset.processSourceBatch(batch, batchIdx)
+		if stop {
+			// Recycle through a fresh local: ipQueue pools the *slice pointer,
+			// so it must not alias the reused batch variable.
+			done := batch
+			// If we are no longer leader bail.
+			if !mset.IsLeader() {
+				msgs.recycle(&done)
+				cleanUp()
+				return
+			}
+			msgs.recycle(&done)
+			batch, batchIdx, wait = nil, 0, nil
+			continue
+		}
+		if g != nil {
+			si := batch[at].si
+			if _, logged := awaitResume[g]; !logged {
+				mset.logCatchUpPaused("source", si.name, g.snapshot())
+				awaitResume[g] = si
+			}
+			wait, batchIdx = g, at
+			continue
+		}
+		done := batch
+		msgs.recycle(&done)
+		batch, batchIdx, wait = nil, 0, nil
 	}
 }
 
@@ -4785,17 +5078,81 @@ func (mset *stream) sendFlowControlReply(reply string, hdr []byte) {
 // handleFlowControl will properly handle flow control messages for both R==1 and R>1.
 // Lock should be held.
 func (mset *stream) handleFlowControl(m *inMsg, dseq, sseq uint64) {
+	mset.sendSyncFlowControlLocked(m.rply, dseq, sseq)
+}
+
+// sendSyncFlowControlLocked answers a mirror/source flow control request,
+// routing the answer through the replication stack when clustered. It is
+// shared by the immediate path and deferred catch-up budget releases.
+// Lock should be held.
+func (mset *stream) sendSyncFlowControlLocked(reply string, dseq, sseq uint64) {
+	if reply == _EMPTY_ || !mset.isLeader() || mset.outq == nil {
+		return
+	}
 	// If we are clustered we will send the flow control message through the replication stack.
 	if mset.isClustered() {
-		// Append the current delivery and stream sequences, to be sent after replication.
-		m.hdr = genHeader(m.hdr, JSLastConsumerSeq, strconv.FormatUint(dseq, 10))
-		m.hdr = genHeader(m.hdr, JSLastStreamSeq, strconv.FormatUint(sseq, 10))
-		mset.node.Propose(mset.term, encodeStreamMsg(_EMPTY_, m.rply, m.hdr, nil, 0, 0, false))
+		hdr := genHeader(nil, JSLastConsumerSeq, strconv.FormatUint(dseq, 10))
+		hdr = genHeader(hdr, JSLastStreamSeq, strconv.FormatUint(sseq, 10))
+		mset.node.Propose(mset.term, encodeStreamMsg(_EMPTY_, reply, hdr, nil, 0, 0, false))
 	} else {
 		const t = "NATS/1.0\r\n%s: %d\r\n%s: %d\r\n\r\n"
 		hdr := fmt.Appendf(nil, t, JSLastConsumerSeq, dseq, JSLastStreamSeq, sseq)
-		mset.outq.send(newJSPubMsg(m.rply, _EMPTY_, _EMPTY_, hdr, nil, nil, 0))
+		mset.outq.send(newJSPubMsg(reply, _EMPTY_, _EMPTY_, hdr, nil, nil, 0))
 	}
+}
+
+// releaseParkedSourceFC answers a flow control request withheld by the
+// source's catch-up gate once the budget allows releasing it.
+func (mset *stream) releaseParkedSourceFC(si *sourceInfo) {
+	if si == nil || si.gate == nil {
+		return
+	}
+	reply, ok := si.gate.takeFCForRelease()
+	if !ok {
+		return
+	}
+	mset.mu.Lock()
+	defer mset.mu.Unlock()
+	if cur := mset.sources[si.iname]; cur == si && mset.isLeader() {
+		mset.sendSyncFlowControlLocked(reply, si.dseq, si.sseq)
+	}
+}
+
+// releaseParkedMirrorFC answers a flow control request withheld by the
+// mirror's catch-up gate once the budget allows releasing it.
+func (mset *stream) releaseParkedMirrorFC(mirror *sourceInfo) {
+	if mirror == nil || mirror.gate == nil {
+		return
+	}
+	reply, ok := mirror.gate.takeFCForRelease()
+	if !ok {
+		return
+	}
+	mset.mu.Lock()
+	defer mset.mu.Unlock()
+	if mset.mirror == mirror && mset.isLeader() {
+		mset.sendSyncFlowControlLocked(reply, mirror.dseq, mirror.sseq)
+	}
+}
+
+// gateControlMessage intercepts a mirror/source control message for an
+// active catch-up gate. It returns true when the message was consumed by the
+// gate (a flow control request that must be withheld, or an idle heartbeat's
+// stalled nudge that must be ignored while an FC is withheld), in which case
+// the caller must not dispatch it.
+func (mset *stream) gateControlMessage(gate *catchupGate, im *inMsg) bool {
+	if gate == nil || !im.isControlMsg() {
+		return false
+	}
+	// Flow control requests carry a reply subject.
+	if im.rply != _EMPTY_ {
+		return gate.tryHoldFC(im.rply)
+	}
+	// Ignore "consumer stalled" nudges while we intentionally withhold FC.
+	if gate.fcHeld() && len(sliceHeader(JSConsumerStalled, im.hdr)) > 0 {
+		return true
+	}
+	return false
 }
 
 // processInboundSourceMsg handles processing other stream messages bound for this stream.
@@ -5109,7 +5466,7 @@ func (mset *stream) resetSourceInfo() {
 		var si *sourceInfo
 
 		if len(ssi.SubjectTransforms) == 0 {
-			si = &sourceInfo{name: ssi.Name, iname: ssi.iname, sf: ssi.FilterSubject}
+			si = &sourceInfo{name: ssi.Name, iname: ssi.iname, sf: ssi.FilterSubject, gate: newCatchUpGate(ssi.CatchUpBudget)}
 		} else {
 			sfs := make([]string, len(ssi.SubjectTransforms))
 			trs := make([]*subjectTransform, len(ssi.SubjectTransforms))
@@ -5121,7 +5478,7 @@ func (mset *stream) resetSourceInfo() {
 				sfs[i] = str.Source
 				trs[i] = tr
 			}
-			si = &sourceInfo{name: ssi.Name, iname: ssi.iname, sfs: sfs, trs: trs}
+			si = &sourceInfo{name: ssi.Name, iname: ssi.iname, sfs: sfs, trs: trs, gate: newCatchUpGate(ssi.CatchUpBudget)}
 		}
 		if sss, ok := sourcesState[ssi.iname]; ok {
 			si.sseq, si.ident = sss.Seq, sss.Ident
@@ -5174,7 +5531,7 @@ func (mset *stream) subscribeToStream() error {
 	// Check if we need to setup mirroring.
 	if mset.cfg.Mirror != nil {
 		// setup the initial mirror sourceInfo
-		mset.mirror = &sourceInfo{name: mset.cfg.Mirror.Name}
+		mset.mirror = &sourceInfo{name: mset.cfg.Mirror.Name, gate: newCatchUpGate(mset.cfg.Mirror.CatchUpBudget)}
 		sfs := make([]string, len(mset.cfg.Mirror.SubjectTransforms))
 		trs := make([]*subjectTransform, len(mset.cfg.Mirror.SubjectTransforms))
 
@@ -5303,6 +5660,9 @@ func (mset *stream) unsubscribeToMirrorDirect() {
 // Lock should be held.
 func (mset *stream) stopSourceConsumers() {
 	for _, si := range mset.sources {
+		if si.gate != nil {
+			si.gate.stop()
+		}
 		mset.cancelSourceInfo(si)
 	}
 }
@@ -5322,6 +5682,9 @@ func (mset *stream) unsubscribeToStream(stopping, shuttingDown bool) error {
 		mset.unsubscribeInternal(subject)
 	}
 	if mset.mirror != nil {
+		if mset.mirror.gate != nil {
+			mset.mirror.gate.stop()
+		}
 		mset.cancelSourceInfo(mset.mirror)
 		mset.mirror = nil
 	}
