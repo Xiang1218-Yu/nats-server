@@ -2258,5 +2258,65 @@
     "help": "",
     "url": "",
     "deprecates": ""
+  },
+  {
+    "constant": "JSTxnNotFoundErr",
+    "code": 404,
+    "error_code": 10228,
+    "description": "configuration transaction not found",
+    "comment": "",
+    "help": "",
+    "url": "",
+    "deprecates": ""
+  },
+  {
+    "constant": "JSTxnInvalidStateErrF",
+    "code": 409,
+    "error_code": 10229,
+    "description": "configuration transaction {id} has invalid state: {state}",
+    "comment": "",
+    "help": "",
+    "url": "",
+    "deprecates": ""
+  },
+  {
+    "constant": "JSTxnTooManyOpsErrF",
+    "code": 400,
+    "error_code": 10230,
+    "description": "configuration transaction has too many operations: {count} exceeds {max}",
+    "comment": "",
+    "help": "",
+    "url": "",
+    "deprecates": ""
+  },
+  {
+    "constant": "JSTxnTTLInvalidErrF",
+    "code": 400,
+    "error_code": 10231,
+    "description": "configuration transaction ttl is invalid: {ttl}",
+    "comment": "",
+    "help": "",
+    "url": "",
+    "deprecates": ""
+  },
+  {
+    "constant": "JSTxnConflictErrF",
+    "code": 409,
+    "error_code": 10232,
+    "description": "configuration transaction conflict on {resource}: expected version {expected}, got {actual}",
+    "comment": "",
+    "help": "",
+    "url": "",
+    "deprecates": ""
+  },
+  {
+    "constant": "JSTxnValidationErrF",
+    "code": 400,
+    "error_code": 10233,
+    "description": "configuration transaction validation failed: {err}",
+    "comment": "",
+    "help": "",
+    "url": "",
+    "deprecates": ""
   }
 ]

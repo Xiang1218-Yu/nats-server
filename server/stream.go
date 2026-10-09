@@ -858,6 +858,13 @@ func (a *Account) addStreamWithAssignmentAndMode(config *StreamConfig, fsConfig 
 	}
 	cfg := &ccfg
 
+	// Seed the standalone configuration version counter from recovered assets
+	// and from configurations carrying an authoritative (meta layer or txn)
+	// stamped version.
+	if ver := configVersionFromMetadata(cfg.Metadata); ver > 0 {
+		jsa.seedConfigVersion(ver)
+	}
+
 	singleServerMode := !s.JetStreamIsClustered() && s.standAloneMode()
 	if singleServerMode && cfg.Replicas > 1 {
 		return nil, ApiErrors[JSStreamReplicasNotSupportedErr]

@@ -13624,7 +13624,7 @@ func TestJetStreamClusterApplyMetaSnapshotRecreateDetection(t *testing.T) {
 		js := &jetStream{srv: &Server{}, cluster: &jetStreamCluster{
 			streams: map[string]map[string]*streamAssignment{acc: {stream: osa}},
 		}}
-		buf, _, _, err := js.encodeMetaSnapshot(map[string]map[string]*streamAssignment{acc: {stream: nsa}})
+		buf, _, _, err := js.encodeMetaSnapshot(map[string]map[string]*streamAssignment{acc: {stream: nsa}}, nil)
 		require_NoError(t, err)
 		ru := &recoveryUpdates{
 			removeStreams:   make(map[string]*streamAssignment),

@@ -682,6 +682,24 @@ const (
 
 	// JSTemplateNameNotMatchSubjectErr template name in subject does not match request
 	JSTemplateNameNotMatchSubjectErr ErrorIdentifier = 10073
+
+	// JSTxnConflictErrF configuration transaction conflict on {resource}: expected version {expected}, got {actual}
+	JSTxnConflictErrF ErrorIdentifier = 10232
+
+	// JSTxnInvalidStateErrF configuration transaction {id} has invalid state: {state}
+	JSTxnInvalidStateErrF ErrorIdentifier = 10229
+
+	// JSTxnNotFoundErr configuration transaction not found
+	JSTxnNotFoundErr ErrorIdentifier = 10228
+
+	// JSTxnTTLInvalidErrF configuration transaction ttl is invalid: {ttl}
+	JSTxnTTLInvalidErrF ErrorIdentifier = 10231
+
+	// JSTxnTooManyOpsErrF configuration transaction has too many operations: {count} exceeds {max}
+	JSTxnTooManyOpsErrF ErrorIdentifier = 10230
+
+	// JSTxnValidationErrF configuration transaction validation failed: {err}
+	JSTxnValidationErrF ErrorIdentifier = 10233
 )
 
 var (
@@ -912,6 +930,12 @@ var (
 		JSStreamWrongLastSequenceErrF:                {Code: 400, ErrCode: 10071, Description: "wrong last sequence: {seq}"},
 		JSTempStorageFailedErr:                       {Code: 500, ErrCode: 10072, Description: "JetStream unable to open temp storage for restore"},
 		JSTemplateNameNotMatchSubjectErr:             {Code: 400, ErrCode: 10073, Description: "template name in subject does not match request"},
+		JSTxnConflictErrF:                            {Code: 409, ErrCode: 10232, Description: "configuration transaction conflict on {resource}: expected version {expected}, got {actual}"},
+		JSTxnInvalidStateErrF:                        {Code: 409, ErrCode: 10229, Description: "configuration transaction {id} has invalid state: {state}"},
+		JSTxnNotFoundErr:                             {Code: 404, ErrCode: 10228, Description: "configuration transaction not found"},
+		JSTxnTTLInvalidErrF:                          {Code: 400, ErrCode: 10231, Description: "configuration transaction ttl is invalid: {ttl}"},
+		JSTxnTooManyOpsErrF:                          {Code: 400, ErrCode: 10230, Description: "configuration transaction has too many operations: {count} exceeds {max}"},
+		JSTxnValidationErrF:                          {Code: 400, ErrCode: 10233, Description: "configuration transaction validation failed: {err}"},
 	}
 	// ErrJetStreamNotClustered Deprecated by JSClusterNotActiveErr ApiError, use IsNatsError() for comparisons
 	ErrJetStreamNotClustered = ApiErrors[JSClusterNotActiveErr]
@@ -3501,4 +3525,94 @@ func NewJSTemplateNameNotMatchSubjectError(opts ...ErrorOption) *ApiError {
 	}
 
 	return ApiErrors[JSTemplateNameNotMatchSubjectErr]
+}
+
+// NewJSTxnConflictError creates a new JSTxnConflictErrF error: "configuration transaction conflict on {resource}: expected version {expected}, got {actual}"
+func NewJSTxnConflictError(actual interface{}, expected interface{}, resource interface{}, opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	e := ApiErrors[JSTxnConflictErrF]
+	args := e.toReplacerArgs([]interface{}{"{actual}", actual, "{expected}", expected, "{resource}", resource})
+	return &ApiError{
+		Code:        e.Code,
+		ErrCode:     e.ErrCode,
+		Description: strings.NewReplacer(args...).Replace(e.Description),
+	}
+}
+
+// NewJSTxnInvalidStateError creates a new JSTxnInvalidStateErrF error: "configuration transaction {id} has invalid state: {state}"
+func NewJSTxnInvalidStateError(id interface{}, state interface{}, opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	e := ApiErrors[JSTxnInvalidStateErrF]
+	args := e.toReplacerArgs([]interface{}{"{id}", id, "{state}", state})
+	return &ApiError{
+		Code:        e.Code,
+		ErrCode:     e.ErrCode,
+		Description: strings.NewReplacer(args...).Replace(e.Description),
+	}
+}
+
+// NewJSTxnNotFoundError creates a new JSTxnNotFoundErr error: "configuration transaction not found"
+func NewJSTxnNotFoundError(opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	return ApiErrors[JSTxnNotFoundErr]
+}
+
+// NewJSTxnTTLInvalidError creates a new JSTxnTTLInvalidErrF error: "configuration transaction ttl is invalid: {ttl}"
+func NewJSTxnTTLInvalidError(ttl interface{}, opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	e := ApiErrors[JSTxnTTLInvalidErrF]
+	args := e.toReplacerArgs([]interface{}{"{ttl}", ttl})
+	return &ApiError{
+		Code:        e.Code,
+		ErrCode:     e.ErrCode,
+		Description: strings.NewReplacer(args...).Replace(e.Description),
+	}
+}
+
+// NewJSTxnTooManyOpsError creates a new JSTxnTooManyOpsErrF error: "configuration transaction has too many operations: {count} exceeds {max}"
+func NewJSTxnTooManyOpsError(count interface{}, max interface{}, opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	e := ApiErrors[JSTxnTooManyOpsErrF]
+	args := e.toReplacerArgs([]interface{}{"{count}", count, "{max}", max})
+	return &ApiError{
+		Code:        e.Code,
+		ErrCode:     e.ErrCode,
+		Description: strings.NewReplacer(args...).Replace(e.Description),
+	}
+}
+
+// NewJSTxnValidationError creates a new JSTxnValidationErrF error: "configuration transaction validation failed: {err}"
+func NewJSTxnValidationError(err error, opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	e := ApiErrors[JSTxnValidationErrF]
+	args := e.toReplacerArgs([]interface{}{"{err}", err})
+	return &ApiError{
+		Code:        e.Code,
+		ErrCode:     e.ErrCode,
+		Description: strings.NewReplacer(args...).Replace(e.Description),
+	}
 }

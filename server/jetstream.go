@@ -175,6 +175,17 @@ type jsAccount struct {
 	inflight sync.Map
 	streams  map[string]*stream
 
+	// Monotonic account-wide configuration version, used by standalone
+	// (non-clustered) JetStream. The clustered counter is maintained in the
+	// meta layer. cfgVersion is only ever bumped on applied configuration
+	// changes and seeded from recovered asset metadata on startup.
+	cfvMu      sync.Mutex
+	cfgVersion uint64
+
+	// Standalone configuration transaction manager (lazily initialized).
+	txnOnce sync.Once
+	txnMgr  *standaloneTxnManager
+
 	// From server
 	sendq *ipQueue[*pubMsg]
 

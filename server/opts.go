@@ -381,6 +381,8 @@ type JSLimitOpts struct {
 	MaxBatchInflightTotal     int           `json:"max_batch_inflight_total,omitempty"`      // MaxBatchInflightTotal is the maximum amount of total open batches per server
 	MaxBatchSize              int           `json:"max_batch_size,omitempty"`                // MaxBatchSize is the maximum amount of messages allowed in a batch publish to a Stream
 	MaxBatchTimeout           time.Duration `json:"max_batch_timeout,omitempty"`             // MaxBatchTimeout is the maximum time to receive the commit message after receiving the first message of a batch
+	MaxTxnTimeout             time.Duration `json:"max_txn_timeout,omitempty"`               // MaxTxnTimeout is the maximum TTL a client may request for a JetStream configuration transaction
+	MaxTxnOps                 int           `json:"max_txn_ops,omitempty"`                   // MaxTxnOps is the maximum number of resource operations allowed in a single configuration transaction
 
 	// Max asset limits
 	DefaultMaxConsumers int `json:"default_max_consumers,omitempty"` // DefaultMaxConsumers is the maximum number of consumers per stream (unless overwritten on the stream or the account) (-1=unlimited)
@@ -2550,6 +2552,14 @@ func parseJetStreamLimits(v any, opts *Options, errors *[]error) error {
 			opts.JetStreamLimits.MaxRequestBatch = int(mv.(int64))
 		case "default_max_consumers":
 			opts.JetStreamLimits.DefaultMaxConsumers = int(mv.(int64))
+		case "max_txn_ops":
+			opts.JetStreamLimits.MaxTxnOps = int(mv.(int64))
+		case "max_txn_timeout":
+			var err error
+			opts.JetStreamLimits.MaxTxnTimeout, err = time.ParseDuration(mv.(string))
+			if err != nil {
+				*errors = append(*errors, err)
+			}
 		case "duplicate_window":
 			var err error
 			opts.JetStreamLimits.Duplicates, err = time.ParseDuration(mv.(string))

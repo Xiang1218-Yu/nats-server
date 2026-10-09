@@ -1132,6 +1132,12 @@ func (s *Server) setJetStreamExportSubs() error {
 		{JSApiConsumerDelete, s.jsConsumerDeleteRequest},
 		{JSApiConsumerPause, s.jsConsumerPauseRequest},
 		{JSApiConsumerUnpin, s.jsConsumerUnpinRequest},
+
+		// Configuration transactions.
+		{JSApiTxnCreate, s.jsTxnCreateRequest},
+		{JSApiTxnCommitSub, s.jsTxnActionRequest("commit")},
+		{JSApiTxnCancelSub, s.jsTxnActionRequest("cancel")},
+		{JSApiTxnInfoSub, s.jsTxnActionRequest("info")},
 	}
 	infopairs := []struct {
 		subject string
@@ -1610,6 +1616,11 @@ func (s *Server) jsStreamCreateRequest(sub *subscription, c *client, _ *Account,
 		return
 	}
 
+	// Assign the next account-wide configuration version (standalone mode).
+	if _, _, jsa := acc.getJetStreamFromAccount(); jsa != nil {
+		jsa.bumpStreamConfigVersion(&cfg.StreamConfig)
+	}
+
 	mset, err := acc.addStreamPedantic(&cfg.StreamConfig, cfg.Pedantic)
 	if err != nil {
 		if IsNatsErr(err, JSStreamStoreFailedF) {
@@ -1718,6 +1729,8 @@ func (s *Server) jsStreamUpdateRequest(sub *subscription, c *client, _ *Account,
 
 	// Update asset version metadata.
 	setStaticStreamMetadata(&cfg)
+	// Assign the next account-wide configuration version (standalone mode).
+	mset.jsa.bumpStreamConfigVersion(&cfg)
 
 	if err := mset.updatePedantic(&cfg, ncfg.Pedantic); err != nil {
 		resp.Error = NewJSStreamUpdateError(err, Unless(err))
@@ -3741,6 +3754,8 @@ func (s *Server) jsStreamDeleteRequest(sub *subscription, c *client, _ *Account,
 		return
 	}
 
+	// Consume a configuration version for the deletion (standalone mode).
+	mset.jsa.bumpConfigVersion()
 	if err := mset.delete(); err != nil {
 		resp.Error = NewJSStreamDeleteError(err, Unless(err))
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
@@ -5253,6 +5268,11 @@ func (s *Server) jsConsumerCreateRequest(sub *subscription, c *client, a *Accoun
 
 	// Initialize/update asset version metadata.
 	setStaticConsumerMetadata(&req.Config)
+	// Assign the next account-wide configuration version (standalone/direct
+	// mode; clustered consumer proposals are versioned by the meta layer).
+	if !isClustered || direct {
+		stream.jsa.bumpConsumerConfigVersion(&req.Config)
+	}
 
 	o, err := stream.addConsumerWithAction(&req.Config, req.Action, req.Pedantic)
 
@@ -5812,6 +5832,8 @@ func (s *Server) jsConsumerDeleteRequest(sub *subscription, c *client, _ *Accoun
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 		return
 	}
+	// Consume a configuration version for the deletion (standalone mode).
+	mset.jsa.bumpConfigVersion()
 	if err := obs.delete(); err != nil {
 		resp.Error = NewJSStreamGeneralError(err, Unless(err))
 		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))

@@ -17,7 +17,8 @@ import "strconv"
 
 const (
 	// JSApiLevel is the maximum supported JetStream API level for this server.
-	JSApiLevel int = 5
+	// Level 6 adds cross-resource configuration transactions.
+	JSApiLevel int = 6
 
 	JSRequiredLevelMetadataKey = "_nats.req.level"
 	JSServerVersionMetadataKey = "_nats.ver"
@@ -49,6 +50,8 @@ func setStaticStreamMetadata(cfg *StreamConfig) {
 	} else {
 		deleteDynamicMetadata(cfg.Metadata)
 	}
+	// Configuration versions are assigned server-side, never client provided.
+	delete(cfg.Metadata, JSCfgVersionMetadataKey)
 
 	var requiredApiLevel int
 	requires := func(level int) {
@@ -117,6 +120,10 @@ func copyStreamMetadata(cfg *StreamConfig, prevCfg *StreamConfig) {
 		deleteDynamicMetadata(cfg.Metadata)
 	}
 	setOrDeleteInStreamMetadata(cfg, prevCfg, JSRequiredLevelMetadataKey)
+	// Idempotent creates compare the incoming config against the stored one;
+	// the server-assigned configuration version must match instead of looking
+	// like a drift. Real updates stamp a fresh version independently.
+	setOrDeleteInStreamMetadata(cfg, prevCfg, JSCfgVersionMetadataKey)
 }
 
 // setOrDeleteInConsumerMetadata sets field with key/value in metadata of cfg if set, deletes otherwise.
@@ -144,6 +151,8 @@ func setStaticConsumerMetadata(cfg *ConsumerConfig) {
 	} else {
 		deleteDynamicMetadata(cfg.Metadata)
 	}
+	// Configuration versions are assigned server-side, never client provided.
+	delete(cfg.Metadata, JSCfgVersionMetadataKey)
 
 	var requiredApiLevel int
 	requires := func(level int) {
@@ -210,6 +219,8 @@ func copyConsumerMetadata(cfg *ConsumerConfig, prevCfg *ConsumerConfig) {
 		deleteDynamicMetadata(cfg.Metadata)
 	}
 	setOrDeleteInConsumerMetadata(cfg, prevCfg, JSRequiredLevelMetadataKey)
+	// See copyStreamMetadata: keep idempotent creates comparable.
+	setOrDeleteInConsumerMetadata(cfg, prevCfg, JSCfgVersionMetadataKey)
 }
 
 // setOrDeleteInConsumerMetadata sets field with key/value in metadata of cfg if set, deletes otherwise.
@@ -233,6 +244,34 @@ func setOrDeleteInConsumerMetadata(cfg *ConsumerConfig, prevCfg *ConsumerConfig,
 func deleteDynamicMetadata(metadata map[string]string) {
 	delete(metadata, JSServerVersionMetadataKey)
 	delete(metadata, JSServerLevelMetadataKey)
+}
+
+// configVersionFromMetadata returns the account-wide configuration version
+// recorded on an asset's metadata, or zero when absent.
+func configVersionFromMetadata(metadata map[string]string) uint64 {
+	if len(metadata) == 0 {
+		return 0
+	}
+	ver, _ := strconv.ParseUint(metadata[JSCfgVersionMetadataKey], 10, 64)
+	return ver
+}
+
+// setStreamConfigVersion stamps the account-wide configuration version onto a
+// stream configuration's metadata, allocating the metadata map when needed.
+func setStreamConfigVersion(cfg *StreamConfig, ver uint64) {
+	if cfg.Metadata == nil {
+		cfg.Metadata = make(map[string]string, 1)
+	}
+	cfg.Metadata[JSCfgVersionMetadataKey] = strconv.FormatUint(ver, 10)
+}
+
+// setConsumerConfigVersion stamps the account-wide configuration version onto a
+// consumer configuration's metadata, allocating the metadata map when needed.
+func setConsumerConfigVersion(cfg *ConsumerConfig, ver uint64) {
+	if cfg.Metadata == nil {
+		cfg.Metadata = make(map[string]string, 1)
+	}
+	cfg.Metadata[JSCfgVersionMetadataKey] = strconv.FormatUint(ver, 10)
 }
 
 // errorOnRequiredApiLevel returns whether a request should be rejected based on the JSRequiredApiLevel header.

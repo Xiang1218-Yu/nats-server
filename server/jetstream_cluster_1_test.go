@@ -8941,7 +8941,7 @@ func TestJetStreamClusterMetaRecoverySnapshotReconcilesStagedUpdates(t *testing.
 			}
 			asa[s.name] = sa
 		}
-		snap, _, _, err := js.encodeMetaSnapshot(map[string]map[string]*streamAssignment{globalAccountName: asa})
+		snap, _, _, err := js.encodeMetaSnapshot(map[string]map[string]*streamAssignment{globalAccountName: asa}, map[string]uint64{globalAccountName: 0})
 		require_NoError(t, err)
 		return []*Entry{{EntrySnapshot, snap}}
 	}

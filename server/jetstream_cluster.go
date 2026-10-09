@@ -47,6 +47,12 @@ type jetStreamCluster struct {
 	// For stream and consumer assignments. All servers will have this be the same.
 	// ACCOUNT -> STREAM -> Stream Assignment -> Consumers
 	streams map[string]map[string]*streamAssignment
+	// Account-wide monotonic configuration versions (ACCOUNT -> version).
+	cfgVersions map[string]uint64
+	// Configuration transactions (ACCOUNT -> txnId -> record), all members.
+	txns map[string]map[string]*txnRecord
+	// Closed when a meta leader's transaction activity must stop.
+	txnStop chan struct{}
 	// These are inflight proposals and used to apply limits when there are
 	// concurrent requests that would otherwise be accepted.
 	// We also record the assignment for the stream/consumer. This is needed since if we have
@@ -177,6 +183,10 @@ const (
 	batchCommitMsgOp
 	// Consumer rest to specific starting sequence.
 	resetSeqOp
+	// Cross-resource configuration transactions.
+	configTxnPrepareOp
+	configTxnCommitOp
+	configTxnAbortOp
 )
 
 // raftGroups are controlled by the metagroup controller.
@@ -1399,12 +1409,14 @@ func (js *jetStream) setupMetaGroup() error {
 	js.mu.Lock()
 	defer js.mu.Unlock()
 	js.cluster = &jetStreamCluster{
-		meta:    n,
-		streams: make(map[string]map[string]*streamAssignment),
-		s:       s,
-		c:       c,
-		qch:     make(chan struct{}),
-		stopped: make(chan struct{}),
+		meta:        n,
+		streams:     make(map[string]map[string]*streamAssignment),
+		cfgVersions: make(map[string]uint64),
+		txns:        make(map[string]map[string]*txnRecord),
+		s:           s,
+		c:           c,
+		qch:         make(chan struct{}),
+		stopped:     make(chan struct{}),
 	}
 	atomic.StoreInt32(&js.clustered, 1)
 	c.registerWithAccount(sysAcc)
@@ -2128,11 +2140,11 @@ func (js *jetStream) monitorCluster() {
 			// - Encode and install as the new snapshot.
 			if data, err := c.LoadLastSnapshot(); err != nil && err != errNoSnapAvailable {
 				abort(err)
-			} else if streams, err := js.decodeMetaSnapshot(data); err != nil {
+			} else if full, err := js.decodeMetaSnapshotFull(data); err != nil {
 				abort(err)
-			} else if err = js.collectStreamAndConsumerChanges(c, streams); err != nil {
+			} else if err = js.collectStreamAndConsumerChanges(c, full); err != nil {
 				abort(err)
-			} else if snap, nsa, nca, err := js.encodeMetaSnapshot(streams); err != nil {
+			} else if snap, nsa, nca, err := js.encodeMetaSnapshot(full.streams, full.versions); err != nil {
 				abort(err)
 			} else if csz, err := c.InstallSnapshot(snap); err != nil {
 				abort(err)
@@ -2383,14 +2395,51 @@ func (js *jetStream) metaSnapshot() ([]byte, int, int, error) {
 	js.mu.RLock()
 	defer js.mu.RUnlock()
 	cc := js.cluster
-	return js.encodeMetaSnapshot(cc.streams)
+	return js.encodeMetaSnapshot(cc.streams, cc.cfgVersions)
 }
 
 func (js *jetStream) applyMetaSnapshot(buf []byte, ru *recoveryUpdates, isRecovering bool) error {
-	streams, err := js.decodeMetaSnapshot(buf)
+	full, err := js.decodeMetaSnapshotFull(buf)
 	if err != nil {
 		return err
 	}
+	streams := full.streams
+
+	// Restore account configuration version counters and retained
+	// transaction records from the snapshot envelope.
+	js.mu.Lock()
+	if cc := js.cluster; cc != nil {
+		if cc.cfgVersions == nil {
+			cc.cfgVersions = make(map[string]uint64)
+		}
+		for acc, ver := range full.versions {
+			if ver > cc.cfgVersions[acc] {
+				cc.cfgVersions[acc] = ver
+			}
+		}
+		if len(full.txns) > 0 && cc.txns == nil {
+			cc.txns = make(map[string]map[string]*txnRecord)
+		}
+		for acc, txns := range full.txns {
+			if cc.txns[acc] == nil {
+				cc.txns[acc] = make(map[string]*txnRecord)
+			}
+			for id, st := range txns {
+				rec := &txnRecord{
+					Id: st.Id, Account: acc, State: st.State, Reason: st.Reason,
+					TTL: time.Duration(st.TTL), Created: st.Created, Updated: st.Updated,
+					Committed: st.Committed, Aborted: st.Aborted, Version: st.Version,
+					Conflicts: st.Conflicts,
+					Plan:      &txnPlan{ops: st.Ops, baseline: st.Baseline},
+				}
+				if rec.Plan.baseline == nil {
+					rec.Plan.baseline = map[string]uint64{}
+				}
+				cc.txns[acc][id] = rec
+			}
+		}
+	}
+	js.mu.Unlock()
 
 	js.mu.Lock()
 	cc := js.cluster
@@ -2563,20 +2612,57 @@ func (js *jetStream) applyMetaSnapshot(buf []byte, ru *recoveryUpdates, isRecove
 }
 
 // Decode the meta snapshot from buf into the relevant stream and consumer assignments.
-func (js *jetStream) decodeMetaSnapshot(buf []byte) (map[string]map[string]*streamAssignment, error) {
+// metaSnapshotEnvelope is the versioned wrapper around a meta snapshot. Older
+// snapshots are bare (s2-compressed) JSON arrays of writeableStreamAssignment;
+// those remain decodable.
+type metaSnapshotEnvelope struct {
+	Format         int                                `json:"format"` // 1 = transaction aware
+	Streams        json.RawMessage                    `json:"streams"`
+	ConfigVersions map[string]uint64                  `json:"config_versions,omitempty"`
+	Txns           map[string]map[string]*snapshotTxn `json:"txns,omitempty"`
+}
+
+type metaSnapshotFull struct {
+	streams  map[string]map[string]*streamAssignment
+	versions map[string]uint64
+	txns     map[string]map[string]*snapshotTxn
+}
+
+func (js *jetStream) decodeMetaSnapshotFull(buf []byte) (*metaSnapshotFull, error) {
+	full := &metaSnapshotFull{
+		streams:  make(map[string]map[string]*streamAssignment),
+		versions: make(map[string]uint64),
+	}
+	if len(buf) == 0 {
+		return full, nil
+	}
+	jse, err := s2.Decode(nil, buf)
+	if err != nil {
+		return nil, err
+	}
+
 	var wsas []writeableStreamAssignment
-	if len(buf) > 0 {
-		jse, err := s2.Decode(nil, buf)
-		if err != nil {
+	trimmed := bytes.TrimLeft(jse, " \t\r\n")
+	if len(trimmed) > 0 && trimmed[0] == '{' {
+		// New envelope format.
+		var env metaSnapshotEnvelope
+		if err := json.Unmarshal(jse, &env); err != nil {
 			return nil, err
 		}
-		if err = json.Unmarshal(jse, &wsas); err != nil {
+		if err := json.Unmarshal(env.Streams, &wsas); err != nil {
+			return nil, err
+		}
+		full.versions = env.ConfigVersions
+		full.txns = env.Txns
+	} else {
+		if err := json.Unmarshal(jse, &wsas); err != nil {
 			return nil, err
 		}
 	}
 
 	// Build our new version here outside of js.
 	streams := make(map[string]map[string]*streamAssignment)
+	var recoveredFromAssets map[string]uint64
 	for _, wsa := range wsas {
 		as := streams[wsa.Client.serviceAccount()]
 		if as == nil {
@@ -2586,6 +2672,14 @@ func (js *jetStream) decodeMetaSnapshot(buf []byte) (map[string]map[string]*stre
 		sa := &streamAssignment{Client: wsa.Client, Created: wsa.Created, ConfigJSON: wsa.ConfigJSON, Group: wsa.Group, Sync: wsa.Sync}
 		if err := decodeStreamAssignmentConfig(js.srv, sa); err != nil {
 			return nil, err
+		}
+		if v := configVersionFromMetadata(sa.Config.Metadata); v > 0 {
+			if recoveredFromAssets == nil {
+				recoveredFromAssets = make(map[string]uint64)
+			}
+			if v > recoveredFromAssets[sa.Client.serviceAccount()] {
+				recoveredFromAssets[sa.Client.serviceAccount()] = v
+			}
 		}
 		if len(wsa.Consumers) > 0 {
 			sa.consumers = make(map[string]*consumerAssignment)
@@ -2597,17 +2691,40 @@ func (js *jetStream) decodeMetaSnapshot(buf []byte) (map[string]map[string]*stre
 				if err := decodeConsumerAssignmentConfig(ca); err != nil {
 					return nil, err
 				}
+				if v := configVersionFromMetadata(ca.Config.Metadata); v > 0 {
+					if recoveredFromAssets == nil {
+						recoveredFromAssets = make(map[string]uint64)
+					}
+					if v > recoveredFromAssets[ca.Client.serviceAccount()] {
+						recoveredFromAssets[ca.Client.serviceAccount()] = v
+					}
+				}
 				sa.consumers[ca.Name] = ca
 			}
 		}
 		as[sa.Config.Name] = sa
 	}
-	return streams, nil
+	full.streams = streams
+
+	// Old snapshot format: reconstruct account version counters as the maximum
+	// version found on surviving assets.
+	if len(full.versions) == 0 {
+		full.versions = recoveredFromAssets
+	}
+	return full, nil
+}
+
+func (js *jetStream) decodeMetaSnapshot(buf []byte) (map[string]map[string]*streamAssignment, error) {
+	full, err := js.decodeMetaSnapshotFull(buf)
+	if err != nil {
+		return nil, err
+	}
+	return full.streams, nil
 }
 
 // Encode the meta assignments into an encoded and compressed buffer.
 // Returns the snapshot itself, and the amount of streams and consumers.
-func (js *jetStream) encodeMetaSnapshot(streams map[string]map[string]*streamAssignment) ([]byte, int, int, error) {
+func (js *jetStream) encodeMetaSnapshot(streams map[string]map[string]*streamAssignment, versions map[string]uint64) ([]byte, int, int, error) {
 	start := time.Now()
 	nsa := 0
 	nca := 0
@@ -2645,9 +2762,44 @@ func (js *jetStream) encodeMetaSnapshot(streams map[string]map[string]*streamAss
 		return nil, nsa, nca, nil
 	}
 
+	// Gather transaction records while holding the js lock briefly.
+	js.mu.RLock()
+	cc := js.cluster
+	var snapTxns map[string]map[string]*snapshotTxn
+	if cc != nil && len(cc.txns) > 0 {
+		snapTxns = make(map[string]map[string]*snapshotTxn, len(cc.txns))
+		for acc, txns := range cc.txns {
+			for id, rec := range txns {
+				if rec == nil {
+					continue
+				}
+				st := &snapshotTxn{
+					Id: rec.Id, State: rec.State, Reason: rec.Reason,
+					TTL: int64(rec.TTL), Created: rec.Created, Updated: rec.Updated,
+					Committed: rec.Committed, Aborted: rec.Aborted,
+					Version: rec.Version, Conflicts: rec.Conflicts,
+				}
+				if rec.Plan != nil {
+					st.Ops = rec.Plan.ops
+					st.Baseline = rec.Plan.baseline
+				}
+				if snapTxns[acc] == nil {
+					snapTxns[acc] = make(map[string]*snapshotTxn)
+				}
+				snapTxns[acc][id] = st
+			}
+		}
+	}
+	js.mu.RUnlock()
+
 	// Track how long it took to marshal the JSON
 	mstart := time.Now()
-	b, err := json.Marshal(out)
+	streamsJSON, err := json.Marshal(out)
+	if err != nil {
+		return nil, nsa, nca, err
+	}
+	env := metaSnapshotEnvelope{Format: 1, Streams: streamsJSON, ConfigVersions: versions, Txns: snapTxns}
+	b, err := json.Marshal(&env)
 	mend := time.Since(mstart)
 
 	// Must not be possible for a JSON marshaling error to result
@@ -2677,7 +2829,12 @@ func (js *jetStream) encodeMetaSnapshot(streams map[string]map[string]*streamAss
 }
 
 // Given a checkpoint, collects all relevant append entries that can be snapshotted.
-func (js *jetStream) collectStreamAndConsumerChanges(c RaftNodeCheckpoint, streams map[string]map[string]*streamAssignment) error {
+func (js *jetStream) collectStreamAndConsumerChanges(c RaftNodeCheckpoint, full *metaSnapshotFull) error {
+	streams := full.streams
+	versions := full.versions
+	if versions == nil {
+		versions = make(map[string]uint64)
+	}
 	ru := &recoveryUpdates{
 		removeStreams:   make(map[string]*streamAssignment),
 		removeConsumers: make(map[string]map[string]*consumerAssignment),
@@ -2685,6 +2842,68 @@ func (js *jetStream) collectStreamAndConsumerChanges(c RaftNodeCheckpoint, strea
 		updateStreams:   make(map[string]*streamAssignment),
 		updateConsumers: make(map[string]map[string]*consumerAssignment),
 	}
+
+	// foldAssignment replays one assignment op into the snapshot state while
+	// maintaining the deterministic account configuration version counter.
+	foldAssignment := func(op entryOp, payload []byte) error {
+		var (
+			account string
+			sa      *streamAssignment
+			ca      *consumerAssignment
+			err     error
+		)
+		switch op {
+		case assignStreamOp, removeStreamOp, updateStreamOp:
+			sa, err = decodeStreamAssignment(js.srv, payload)
+			if err == nil {
+				account = sa.Client.serviceAccount()
+			}
+		case assignConsumerOp:
+			ca, err = decodeConsumerAssignment(payload)
+			if err == nil {
+				account = ca.Client.serviceAccount()
+			}
+		case assignCompressedConsumerOp:
+			ca, err = decodeConsumerAssignmentCompressed(payload)
+			if err == nil {
+				account = ca.Client.serviceAccount()
+			}
+		case removeConsumerOp:
+			ca, err = decodeConsumerAssignment(payload)
+			if err == nil {
+				account = ca.Client.serviceAccount()
+			}
+		default:
+			return errBadEntryOp
+		}
+		if err != nil {
+			js.srv.Errorf("JetStream cluster failed to decode assignment during snapshot compaction: %q", payload)
+			return err
+		}
+		versions[account]++
+		ver := versions[account]
+		if sa != nil {
+			stampStreamAssignmentVersion(sa, ver)
+			switch op {
+			case removeStreamOp:
+				ru.removeStream(sa)
+			case updateStreamOp:
+				ru.updateStream(sa)
+			default:
+				ru.addStream(sa)
+			}
+		}
+		if ca != nil {
+			stampConsumerAssignmentVersion(ca, ver)
+			if op == removeConsumerOp {
+				ru.removeConsumer(ca)
+			} else {
+				ru.addOrUpdateConsumer(ca)
+			}
+		}
+		return nil
+	}
+
 	for ae, err := range c.AppendEntriesSeq() {
 		if err != nil {
 			return err
@@ -2697,44 +2916,74 @@ func (js *jetStream) collectStreamAndConsumerChanges(c RaftNodeCheckpoint, strea
 				}
 				op := entryOp(buf[0])
 				switch op {
-				case assignStreamOp, updateStreamOp, removeStreamOp:
-					sa, err := decodeStreamAssignment(js.srv, buf[1:])
-					if err != nil {
-						js.srv.Errorf("JetStream cluster failed to decode stream assignment: %q", buf[1:])
+				case assignStreamOp, updateStreamOp, removeStreamOp,
+					assignConsumerOp, assignCompressedConsumerOp, removeConsumerOp:
+					if err := foldAssignment(op, buf[1:]); err != nil {
 						return err
 					}
-					if op == removeStreamOp {
-						ru.removeStream(sa)
-					} else {
-						ru.addStream(sa)
-					}
-				case assignConsumerOp:
-					ca, err := decodeConsumerAssignment(buf[1:])
+				case configTxnPrepareOp, configTxnAbortOp:
+					// Transaction state is folded from live cc at encode time;
+					// nothing to apply to the assignment set here.
+				case configTxnCommitOp:
+					mtx, err := decodeMetaTxn(buf[1:])
 					if err != nil {
-						js.srv.Errorf("JetStream cluster failed to decode consumer assignment: %q", buf[1:])
 						return err
 					}
-					ru.addOrUpdateConsumer(ca)
-				case assignCompressedConsumerOp:
-					ca, err := decodeConsumerAssignmentCompressed(buf[1:])
-					if err != nil {
-						js.srv.Errorf("JetStream cluster failed to decode compressed consumer assignment: %q", buf[1:])
-						return err
+					versions[mtx.Account]++
+					ver := versions[mtx.Account]
+					for _, step := range mtx.Steps {
+						if len(step) == 0 {
+							continue
+						}
+						sop := entryOp(step[0])
+						var (
+							sa *streamAssignment
+							ca *consumerAssignment
+							ec error
+						)
+						switch sop {
+						case assignStreamOp, removeStreamOp, updateStreamOp:
+							sa, ec = decodeStreamAssignment(js.srv, step[1:])
+							if ec == nil {
+								stampStreamAssignmentVersion(sa, ver)
+								if sop == removeStreamOp {
+									ru.removeStream(sa)
+								} else if sop == updateStreamOp {
+									ru.updateStream(sa)
+								} else {
+									ru.addStream(sa)
+								}
+							}
+						case assignConsumerOp, assignCompressedConsumerOp:
+							if sop == assignCompressedConsumerOp {
+								ca, ec = decodeConsumerAssignmentCompressed(step[1:])
+							} else {
+								ca, ec = decodeConsumerAssignment(step[1:])
+							}
+							if ec == nil {
+								stampConsumerAssignmentVersion(ca, ver)
+								ru.addOrUpdateConsumer(ca)
+							}
+						case removeConsumerOp:
+							ca, ec = decodeConsumerAssignment(step[1:])
+							if ec == nil {
+								stampConsumerAssignmentVersion(ca, ver)
+								ru.removeConsumer(ca)
+							}
+						default:
+							ec = errBadEntryOp
+						}
+						if ec != nil {
+							return ec
+						}
 					}
-					ru.addOrUpdateConsumer(ca)
-				case removeConsumerOp:
-					ca, err := decodeConsumerAssignment(buf[1:])
-					if err != nil {
-						js.srv.Errorf("JetStream cluster failed to decode consumer assignment: %q", buf[1:])
-						return err
-					}
-					ru.removeConsumer(ca)
 				default:
 					return fmt.Errorf("unknown meta entry op type: %v", entryOp(buf[0]))
 				}
 			}
 		}
 	}
+	full.versions = versions
 
 	// With our recovery structure, apply the stream/consumer diff.
 	for _, cas := range ru.removeConsumers {
@@ -3469,81 +3718,22 @@ func (js *jetStream) applyMetaEntries(entries []*Entry, ru *recoveryUpdates) (bo
 			if len(buf) == 0 {
 				return isRecovering, didSnap, errBadEntryOp
 			}
-			switch entryOp(buf[0]) {
-			case assignStreamOp:
-				sa, err := decodeStreamAssignment(js.srv, buf[1:])
+			switch op := entryOp(buf[0]); op {
+			case configTxnPrepareOp, configTxnCommitOp, configTxnAbortOp:
+				mtx, err := decodeMetaTxn(buf[1:])
 				if err != nil {
-					js.srv.Errorf("JetStream cluster failed to decode stream assignment: %q", buf[1:])
+					js.srv.Errorf("JetStream cluster failed to decode configuration transaction: %q", buf[1:])
 					return isRecovering, didSnap, err
 				}
-				if isRecovering {
-					js.setStreamAssignmentRecovering(sa)
-					ru.addStream(sa)
-				} else {
-					js.processStreamAssignment(sa)
-				}
-			case removeStreamOp:
-				sa, err := decodeStreamAssignment(js.srv, buf[1:])
-				if err != nil {
-					js.srv.Errorf("JetStream cluster failed to decode stream assignment: %q", buf[1:])
-					return isRecovering, didSnap, err
-				}
-				if isRecovering {
-					js.setStreamAssignmentRecovering(sa)
-					ru.removeStream(sa)
-				} else {
-					js.processStreamRemoval(sa)
-				}
-			case assignConsumerOp:
-				ca, err := decodeConsumerAssignment(buf[1:])
-				if err != nil {
-					js.srv.Errorf("JetStream cluster failed to decode consumer assignment: %q", buf[1:])
-					return isRecovering, didSnap, err
-				}
-				if isRecovering {
-					js.setConsumerAssignmentRecovering(ca)
-					ru.addOrUpdateConsumer(ca)
-				} else {
-					js.processConsumerAssignment(ca)
-				}
-			case assignCompressedConsumerOp:
-				ca, err := decodeConsumerAssignmentCompressed(buf[1:])
-				if err != nil {
-					js.srv.Errorf("JetStream cluster failed to decode compressed consumer assignment: %q", buf[1:])
-					return isRecovering, didSnap, err
-				}
-				if isRecovering {
-					js.setConsumerAssignmentRecovering(ca)
-					ru.addOrUpdateConsumer(ca)
-				} else {
-					js.processConsumerAssignment(ca)
-				}
-			case removeConsumerOp:
-				ca, err := decodeConsumerAssignment(buf[1:])
-				if err != nil {
-					js.srv.Errorf("JetStream cluster failed to decode consumer assignment: %q", buf[1:])
-					return isRecovering, didSnap, err
-				}
-				if isRecovering {
-					js.setConsumerAssignmentRecovering(ca)
-					ru.removeConsumer(ca)
-				} else {
-					js.processConsumerRemoval(ca)
-				}
-			case updateStreamOp:
-				sa, err := decodeStreamAssignment(js.srv, buf[1:])
-				if err != nil {
-					js.srv.Errorf("JetStream cluster failed to decode stream assignment: %q", buf[1:])
-					return isRecovering, didSnap, err
-				}
-				if isRecovering {
-					js.setStreamAssignmentRecovering(sa)
-					ru.updateStream(sa)
-				} else {
-					js.processUpdateStreamAssignment(sa)
-				}
+				js.applyConfigTxn(mtx, ru)
 			default:
-				return isRecovering, didSnap, fmt.Errorf("unknown meta entry op type: %v", entryOp(buf[0]))
+				var ruArg *recoveryUpdates
+				if isRecovering {
+					ruArg = ru
+				}
+				if err := js.applyMetaAssignmentOp(op, buf[1:], ruArg, 0); err != nil {
+					return isRecovering, didSnap, err
+				}
 			}
 		}
 	}
@@ -9361,6 +9551,14 @@ func (js *jetStream) startUpdatesSub() {
 // Lock should be held.
 func (js *jetStream) stopUpdatesSub() {
 	cc := js.cluster
+	if cc.txnStop != nil {
+		select {
+		case <-cc.txnStop:
+		default:
+			close(cc.txnStop)
+		}
+		cc.txnStop = nil
+	}
 	if cc.streamResults != nil {
 		cc.s.sysUnsubscribe(cc.streamResults)
 		cc.streamResults = nil
@@ -9491,7 +9689,11 @@ func (js *jetStream) processLeaderChange(isLeader bool, term uint64) {
 
 	if isLeader {
 		js.startUpdatesSub()
+		// Arm transaction leadership activity (TTL sweeper, pending
+		// responses) once the lock is released.
+		s.startGoRoutine(js.txnLeaderInit)
 	} else {
+		// stopUpdatesSub also signals transaction leader activity to stop.
 		js.stopUpdatesSub()
 		// TODO(dlc) - stepdown.
 	}

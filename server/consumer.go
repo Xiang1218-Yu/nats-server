@@ -1085,6 +1085,13 @@ func (mset *stream) addConsumerWithAssignmentAndMode(config *ConsumerConfig, ona
 	if err := checkConsumerCfg(config, srvLim, &cfg, acc, selectedLimits, isRecovering); err != nil {
 		return nil, err
 	}
+
+	// Seed the standalone configuration version counter from recovered
+	// consumers and from configurations stamped by the meta layer or a txn.
+	if ver := configVersionFromMetadata(config.Metadata); ver > 0 {
+		jsa.seedConfigVersion(ver)
+	}
+
 	sampleFreq := 0
 	if config.SampleFrequency != _EMPTY_ {
 		// Can't fail as checkConsumerCfg checks correct format
