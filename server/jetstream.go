@@ -871,6 +871,8 @@ func (s *Server) configJetStream(acc *Account, tq chan<- func()) error {
 				s.switchAccountToInterestMode(acc.GetName())
 			}
 		}
+		// Start the Object Store subsystem for this account.
+		acc.startObjectStore()
 	} else if acc != s.SystemAccount() {
 		if acc.JetStreamEnabled() {
 			acc.DisableJetStream()
@@ -2621,6 +2623,11 @@ func (jsa *jsAccount) acc() *Account {
 // Delete the JetStream resources.
 func (jsa *jsAccount) delete() {
 	var streams []*stream
+
+	// Stop the Object Store subsystem for this account.
+	if acc := jsa.account; acc != nil {
+		acc.stopObjectStore()
+	}
 
 	jsa.mu.Lock()
 	// The update timer and subs need to be protected by usageMu lock

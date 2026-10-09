@@ -69,6 +69,7 @@ type Account struct {
 	sl           *Sublist
 	ic           *client
 	sq           *sendq
+	obj          *objStore
 	isid         uint64
 	etmr         *time.Timer
 	ctmr         *time.Timer
