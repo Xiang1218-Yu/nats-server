@@ -382,6 +382,12 @@ type JSLimitOpts struct {
 	MaxBatchSize              int           `json:"max_batch_size,omitempty"`                // MaxBatchSize is the maximum amount of messages allowed in a batch publish to a Stream
 	MaxBatchTimeout           time.Duration `json:"max_batch_timeout,omitempty"`             // MaxBatchTimeout is the maximum time to receive the commit message after receiving the first message of a batch
 
+	// Read snapshot limits (0 means use the built-in defaults).
+	MaxReadSnapshots     int           `json:"max_read_snapshots,omitempty"`      // MaxReadSnapshots is the maximum number of read snapshots per stream (including invalidated tombstones)
+	MaxReadSnapshotTTL   time.Duration `json:"max_read_snapshot_ttl,omitempty"`   // MaxReadSnapshotTTL is the maximum TTL a client may request for a read snapshot
+	MaxReadSnapshotBytes int64         `json:"max_read_snapshot_bytes,omitempty"` // MaxReadSnapshotBytes is the maximum retained bytes per read snapshot
+	MaxReadSnapshotBatch int           `json:"max_read_snapshot_batch,omitempty"` // MaxReadSnapshotBatch is the maximum number of messages returned by one snapshot read request
+
 	// Max asset limits
 	DefaultMaxConsumers int `json:"default_max_consumers,omitempty"` // DefaultMaxConsumers is the maximum number of consumers per stream (unless overwritten on the stream or the account) (-1=unlimited)
 }
@@ -2560,6 +2566,18 @@ func parseJetStreamLimits(v any, opts *Options, errors *[]error) error {
 			if err := parseJetStreamLimitsBatch(tk, opts, errors); err != nil {
 				return err
 			}
+		case "max_read_snapshots":
+			opts.JetStreamLimits.MaxReadSnapshots = int(mv.(int64))
+		case "max_read_snapshot_ttl":
+			var err error
+			opts.JetStreamLimits.MaxReadSnapshotTTL, err = time.ParseDuration(mv.(string))
+			if err != nil {
+				*errors = append(*errors, err)
+			}
+		case "max_read_snapshot_bytes":
+			opts.JetStreamLimits.MaxReadSnapshotBytes = mv.(int64)
+		case "max_read_snapshot_batch":
+			opts.JetStreamLimits.MaxReadSnapshotBatch = int(mv.(int64))
 		default:
 			if !tk.IsUsedVariable() {
 				err := &unknownConfigFieldErr{

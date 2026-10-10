@@ -464,6 +464,21 @@ const (
 	// JSRaftGeneralErrF General RAFT error string ({err})
 	JSRaftGeneralErrF ErrorIdentifier = 10041
 
+	// JSReadSnapshotBadRequestErr read snapshot request invalid
+	JSReadSnapshotBadRequestErr ErrorIdentifier = 10231
+
+	// JSReadSnapshotCursorMismatchErr read snapshot cursor mismatch
+	JSReadSnapshotCursorMismatchErr ErrorIdentifier = 10232
+
+	// JSReadSnapshotInvalidErr read snapshot invalid: {reason}
+	JSReadSnapshotInvalidErr ErrorIdentifier = 10229
+
+	// JSReadSnapshotLimitReachedErr read snapshot limit reached
+	JSReadSnapshotLimitReachedErr ErrorIdentifier = 10230
+
+	// JSReadSnapshotNotFoundErr read snapshot not found
+	JSReadSnapshotNotFoundErr ErrorIdentifier = 10228
+
 	// JSReplicasCountCannotBeNegative replicas count cannot be negative
 	JSReplicasCountCannotBeNegative ErrorIdentifier = 10133
 
@@ -839,6 +854,11 @@ var (
 		JSPedanticErrF:                               {Code: 400, ErrCode: 10157, Description: "pedantic mode: {err}"},
 		JSPeerRemapErr:                               {Code: 503, ErrCode: 10075, Description: "peer remap failed"},
 		JSRaftGeneralErrF:                            {Code: 500, ErrCode: 10041, Description: "{err}"},
+		JSReadSnapshotBadRequestErr:                  {Code: 400, ErrCode: 10231, Description: "read snapshot request invalid"},
+		JSReadSnapshotCursorMismatchErr:              {Code: 409, ErrCode: 10232, Description: "read snapshot cursor mismatch"},
+		JSReadSnapshotInvalidErr:                     {Code: 409, ErrCode: 10229, Description: "read snapshot invalid: {reason}"},
+		JSReadSnapshotLimitReachedErr:                {Code: 403, ErrCode: 10230, Description: "read snapshot limit reached"},
+		JSReadSnapshotNotFoundErr:                    {Code: 404, ErrCode: 10228, Description: "read snapshot not found"},
 		JSReplicasCountCannotBeNegative:              {Code: 400, ErrCode: 10133, Description: "replicas count cannot be negative"},
 		JSRequiredApiLevelErr:                        {Code: 412, ErrCode: 10185, Description: "JetStream minimum api level required"},
 		JSRestoreSubscribeFailedErrF:                 {Code: 500, ErrCode: 10042, Description: "JetStream unable to subscribe to restore snapshot {subject}: {err}"},
@@ -2603,6 +2623,62 @@ func NewJSRaftGeneralError(err error, opts ...ErrorOption) *ApiError {
 		ErrCode:     e.ErrCode,
 		Description: strings.NewReplacer(args...).Replace(e.Description),
 	}
+}
+
+// NewJSReadSnapshotBadRequestError creates a new JSReadSnapshotBadRequestErr error: "read snapshot request invalid"
+func NewJSReadSnapshotBadRequestError(opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	return ApiErrors[JSReadSnapshotBadRequestErr]
+}
+
+// NewJSReadSnapshotCursorMismatchError creates a new JSReadSnapshotCursorMismatchErr error: "read snapshot cursor mismatch"
+func NewJSReadSnapshotCursorMismatchError(opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	return ApiErrors[JSReadSnapshotCursorMismatchErr]
+}
+
+// NewJSReadSnapshotInvalidError creates a new JSReadSnapshotInvalidErr error: "read snapshot invalid: {reason}"
+func NewJSReadSnapshotInvalidError(reason interface{}, opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	e := ApiErrors[JSReadSnapshotInvalidErr]
+	args := e.toReplacerArgs([]interface{}{"{reason}", reason})
+	return &ApiError{
+		Code:        e.Code,
+		ErrCode:     e.ErrCode,
+		Description: strings.NewReplacer(args...).Replace(e.Description),
+	}
+}
+
+// NewJSReadSnapshotLimitReachedError creates a new JSReadSnapshotLimitReachedErr error: "read snapshot limit reached"
+func NewJSReadSnapshotLimitReachedError(opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	return ApiErrors[JSReadSnapshotLimitReachedErr]
+}
+
+// NewJSReadSnapshotNotFoundError creates a new JSReadSnapshotNotFoundErr error: "read snapshot not found"
+func NewJSReadSnapshotNotFoundError(opts ...ErrorOption) *ApiError {
+	eopts := parseOpts(opts)
+	if ae, ok := eopts.err.(*ApiError); ok {
+		return ae
+	}
+
+	return ApiErrors[JSReadSnapshotNotFoundErr]
 }
 
 // NewJSReplicasCountCannotBeNegativeError creates a new JSReplicasCountCannotBeNegative error: "replicas count cannot be negative"

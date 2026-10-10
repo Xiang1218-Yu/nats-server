@@ -102,6 +102,19 @@ const (
 	JSApiMsgGet  = "$JS.API.STREAM.MSG.GET.*"
 	JSApiMsgGetT = "$JS.API.STREAM.MSG.GET.%s"
 
+	// Read snapshot endpoints provide short lived, bounded, cursor based
+	// consistent reads over a stream/filter/sequence range.
+	JSApiReadSnapshotCreate  = "$JS.API.STREAM.READ_SNAPSHOT.CREATE.*"
+	JSApiReadSnapshotCreateT = "$JS.API.STREAM.READ_SNAPSHOT.CREATE.%s"
+	JSApiReadSnapshotRead    = "$JS.API.STREAM.READ_SNAPSHOT.READ.*"
+	JSApiReadSnapshotReadT   = "$JS.API.STREAM.READ_SNAPSHOT.READ.%s"
+	JSApiReadSnapshotInfo    = "$JS.API.STREAM.READ_SNAPSHOT.INFO.*"
+	JSApiReadSnapshotInfoT   = "$JS.API.STREAM.READ_SNAPSHOT.INFO.%s"
+	JSApiReadSnapshotDelete  = "$JS.API.STREAM.READ_SNAPSHOT.DELETE.*"
+	JSApiReadSnapshotDeleteT = "$JS.API.STREAM.READ_SNAPSHOT.DELETE.%s"
+	JSApiReadSnapshotList    = "$JS.API.STREAM.READ_SNAPSHOT.LIST.*"
+	JSApiReadSnapshotListT   = "$JS.API.STREAM.READ_SNAPSHOT.LIST.%s"
+
 	// JSDirectMsgGet is the template for non-api layer direct requests for a message by its stream sequence number or last by subject.
 	// Will return the message similar to how a consumer receives the message, no JSON processing.
 	// If the message can not be found we will use a status header of 404. If the stream does not exist the client will get a no-responders or timeout.
@@ -836,6 +849,94 @@ type JSApiMsgGetResponse struct {
 
 const JSApiMsgGetResponseType = "io.nats.jetstream.api.v1.stream_msg_get_response"
 
+// JSApiReadSnapshotInfo is the externally visible state of a read snapshot.
+type JSReadSnapshotInfo struct {
+	SnapshotID    string    `json:"snapshot_id"`
+	Stream        string    `json:"stream"`
+	Status        string    `json:"status"`
+	Reason        string    `json:"reason,omitempty"`
+	Filter        string    `json:"filter,omitempty"`
+	StartSeq      uint64    `json:"start_seq"`
+	EndSeq        uint64    `json:"end_seq"`
+	Cursor        uint64    `json:"cursor"`
+	RemainingMsgs uint64    `json:"remaining_messages"`
+	RetainedMsgs  int       `json:"retained_messages"`
+	RetainedBytes int64     `json:"retained_bytes"`
+	MaxBytes      int64     `json:"max_bytes,omitempty"`
+	Created       time.Time `json:"created"`
+	Expires       time.Time `json:"expires"`
+}
+
+// JSApiReadSnapshotCreateRequest creates a read snapshot for an optional
+// subject filter and sequence range. Empty fields resolve to the whole stream
+// at creation time; ttl/max_bytes are bounded by server configuration.
+type JSApiReadSnapshotCreateRequest struct {
+	Filter   string        `json:"filter,omitempty"`
+	StartSeq uint64        `json:"start_seq,omitempty"`
+	EndSeq   uint64        `json:"end_seq,omitempty"`
+	TTL      time.Duration `json:"ttl,omitempty"`
+	MaxBytes int64         `json:"max_bytes,omitempty"`
+}
+
+type JSApiReadSnapshotCreateResponse struct {
+	ApiResponse
+	Snapshot *JSReadSnapshotInfo `json:"snapshot,omitempty"`
+}
+
+const JSApiReadSnapshotCreateResponseType = "io.nats.jetstream.api.v1.stream_read_snapshot_create_response"
+
+// JSApiReadSnapshotReadRequest reads the next batch of a snapshot. A zero
+// cursor continues from the server side cursor; a stale cursor is a 409.
+type JSApiReadSnapshotReadRequest struct {
+	SnapshotID string `json:"snapshot_id"`
+	Batch      int    `json:"batch,omitempty"`
+	MaxBytes   int64  `json:"max_bytes,omitempty"`
+	Cursor     uint64 `json:"cursor,omitempty"`
+}
+
+type JSApiReadSnapshotReadResponse struct {
+	ApiResponse
+	Snapshot          *JSReadSnapshotInfo `json:"snapshot,omitempty"`
+	Messages          []*StoredMsg        `json:"messages,omitempty"`
+	Cursor            uint64              `json:"cursor"`
+	RemainingMessages uint64              `json:"remaining_messages"`
+	Complete          bool                `json:"complete"`
+}
+
+const JSApiReadSnapshotReadResponseType = "io.nats.jetstream.api.v1.stream_read_snapshot_read_response"
+
+type JSApiReadSnapshotInfoRequest struct {
+	SnapshotID string `json:"snapshot_id"`
+}
+
+type JSApiReadSnapshotInfoResponse struct {
+	ApiResponse
+	Snapshot *JSReadSnapshotInfo `json:"snapshot,omitempty"`
+}
+
+const JSApiReadSnapshotInfoResponseType = "io.nats.jetstream.api.v1.stream_read_snapshot_info_response"
+
+type JSApiReadSnapshotDeleteRequest struct {
+	SnapshotID string `json:"snapshot_id"`
+}
+
+type JSApiReadSnapshotDeleteResponse struct {
+	ApiResponse
+	Success bool `json:"success"`
+}
+
+const JSApiReadSnapshotDeleteResponseType = "io.nats.jetstream.api.v1.stream_read_snapshot_delete_response"
+
+type JSApiReadSnapshotListRequest struct{}
+
+type JSApiReadSnapshotListResponse struct {
+	ApiResponse
+	Total     int                   `json:"total"`
+	Snapshots []*JSReadSnapshotInfo `json:"snapshots,omitempty"`
+}
+
+const JSApiReadSnapshotListResponseType = "io.nats.jetstream.api.v1.stream_read_snapshot_list_response"
+
 // JSWaitQueueDefaultMax is the default max number of outstanding requests for pull consumers.
 const JSWaitQueueDefaultMax = 512
 
@@ -1126,6 +1227,9 @@ func (s *Server) setJetStreamExportSubs() error {
 		{JSApiConsumerEvacuatePeer, s.jsConsumerEvacuatePeerRequest},
 		{JSApiMsgDelete, s.jsMsgDeleteRequest},
 		{JSApiMsgGet, s.jsMsgGetRequest},
+		{JSApiReadSnapshotCreate, s.jsReadSnapshotCreateRequest},
+		{JSApiReadSnapshotRead, s.jsReadSnapshotReadRequest},
+		{JSApiReadSnapshotDelete, s.jsReadSnapshotDeleteRequest},
 		{JSApiConsumerCreateEx, s.jsConsumerCreateRequest},
 		{JSApiConsumerCreate, s.jsConsumerCreateRequest},
 		{JSApiDurableCreate, s.jsConsumerCreateRequest},
@@ -1144,6 +1248,8 @@ func (s *Server) setJetStreamExportSubs() error {
 		{JSApiConsumers, s.jsConsumerNamesRequest},
 		{JSApiConsumerList, s.jsConsumerListRequest},
 		{JSApiConsumerInfo, s.jsConsumerInfoRequest},
+		{JSApiReadSnapshotInfo, s.jsReadSnapshotInfoRequest},
+		{JSApiReadSnapshotList, s.jsReadSnapshotListRequest},
 	}
 
 	js.mu.Lock()
@@ -4035,6 +4141,464 @@ func (s *Server) jsMsgGetRequest(sub *subscription, c *client, _ *Account, subje
 
 	// Don't send response through API layer for this call.
 	s.sendInternalAccountMsg(nil, reply, s.jsonResponse(resp))
+}
+
+// readSnapshotGate mirrors the stream leader gating done by jsMsgGetRequest:
+// followers stay silent (the leader answers), leaderless groups return 503 and
+// unknown streams return 404 on the meta leader. Returns (proceed, apiErr):
+// proceed=false with nil apiErr means "return silently".
+func (s *Server) readSnapshotGate(acc *Account, stream string) (bool, *ApiError) {
+	if !s.JetStreamIsClustered() {
+		return true, nil
+	}
+	js, cc := s.getJetStreamCluster()
+	if js == nil || cc == nil {
+		return false, nil
+	}
+	if js.isLeaderless() {
+		return false, NewJSClusterNotAvailError()
+	}
+
+	js.mu.RLock()
+	isLeader, sa := cc.isLeader(), js.streamAssignment(acc.Name, stream)
+	js.mu.RUnlock()
+
+	if isLeader && sa == nil {
+		if hasJS, doErr := acc.checkJetStream(); !hasJS {
+			if doErr {
+				return false, NewJSNotEnabledForAccountError()
+			}
+			return false, nil
+		}
+		return false, NewJSStreamNotFoundError()
+	} else if sa == nil {
+		return false, nil
+	}
+
+	if js.isGroupLeaderless(sa.Group) {
+		return false, NewJSClusterNotAvailError()
+	}
+
+	if !acc.JetStreamIsStreamLeader(stream) {
+		return false, nil
+	}
+	return true, nil
+}
+
+func jsReadSnapshotStoreError(err error) *ApiError {
+	var invalid *ReadSnapshotInvalidError
+	switch {
+	case errors.As(err, &invalid):
+		return NewJSReadSnapshotInvalidError(invalid.Reason)
+	case errors.Is(err, ErrReadSnapshotNotFound):
+		return NewJSReadSnapshotNotFoundError()
+	case errors.Is(err, ErrReadSnapshotLimit):
+		return NewJSReadSnapshotLimitReachedError()
+	case errors.Is(err, ErrReadSnapshotCursor):
+		return NewJSReadSnapshotCursorMismatchError()
+	case errors.Is(err, ErrReadSnapshotBadRange):
+		return NewJSReadSnapshotBadRequestError()
+	default:
+		return NewJSReadSnapshotBadRequestError()
+	}
+}
+
+func jsReadSnapshotInfo(stream string, st ReadSnapshotState) *JSReadSnapshotInfo {
+	return &JSReadSnapshotInfo{
+		SnapshotID:    st.ID,
+		Stream:        stream,
+		Status:        st.Status,
+		Reason:        st.Reason,
+		Filter:        st.Filter,
+		StartSeq:      st.StartSeq,
+		EndSeq:        st.EndSeq,
+		Cursor:        st.Cursor,
+		RemainingMsgs: st.RemainingMsgs,
+		RetainedMsgs:  st.RetainedMsgs,
+		RetainedBytes: st.RetainedBytes,
+		MaxBytes:      st.MaxBytes,
+		Created:       st.Created,
+		Expires:       st.Expires,
+	}
+}
+
+func (s *Server) jsReadSnapshotCreateRequest(sub *subscription, c *client, _ *Account, subject, reply string, rmsg []byte) {
+	if c == nil || !s.JetStreamEnabled() {
+		return
+	}
+	ci, acc, hdr, msg, err := s.getRequestInfo(c, rmsg)
+	if err != nil {
+		s.Warnf(badAPIRequestT, msg)
+		return
+	}
+
+	stream := tokenAt(subject, 6)
+	resp := JSApiReadSnapshotCreateResponse{ApiResponse: ApiResponse{Type: JSApiReadSnapshotCreateResponseType}}
+
+	proceed, apiErr := s.readSnapshotGate(acc, stream)
+	if !proceed {
+		if apiErr != nil {
+			resp.Error = apiErr
+			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		}
+		return
+	}
+
+	if errorOnRequiredApiLevel(hdr) {
+		resp.Error = NewJSRequiredApiLevelError()
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+	if hasJS, doErr := acc.checkJetStream(); !hasJS {
+		if doErr {
+			resp.Error = NewJSNotEnabledForAccountError()
+			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		}
+		return
+	}
+
+	var req JSApiReadSnapshotCreateRequest
+	if !isEmptyRequest(msg) {
+		if err := s.unmarshalRequest(c, acc, subject, msg, &req); err != nil {
+			resp.Error = NewJSInvalidJSONError(err)
+			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+			return
+		}
+	}
+
+	mset, err := acc.lookupStream(stream)
+	if err != nil {
+		resp.Error = NewJSStreamNotFoundError()
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+	if mset.offlineReason != _EMPTY_ {
+		return
+	}
+
+	cfg := ReadSnapshotConfig{
+		Filter:   req.Filter,
+		StartSeq: req.StartSeq,
+		EndSeq:   req.EndSeq,
+		TTL:      req.TTL,
+		MaxBytes: req.MaxBytes,
+	}
+	rs, err := mset.createReadSnapshot(cfg)
+	if err != nil {
+		resp.Error = jsReadSnapshotStoreError(err)
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+
+	resp.Snapshot = jsReadSnapshotInfo(stream, rs.State())
+	s.sendAPIResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+}
+
+func (s *Server) jsReadSnapshotReadRequest(sub *subscription, c *client, _ *Account, subject, reply string, rmsg []byte) {
+	if c == nil || !s.JetStreamEnabled() {
+		return
+	}
+	ci, acc, hdr, msg, err := s.getRequestInfo(c, rmsg)
+	if err != nil {
+		s.Warnf(badAPIRequestT, msg)
+		return
+	}
+
+	stream := tokenAt(subject, 6)
+	resp := JSApiReadSnapshotReadResponse{ApiResponse: ApiResponse{Type: JSApiReadSnapshotReadResponseType}}
+
+	proceed, apiErr := s.readSnapshotGate(acc, stream)
+	if !proceed {
+		if apiErr != nil {
+			resp.Error = apiErr
+			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		}
+		return
+	}
+
+	if errorOnRequiredApiLevel(hdr) {
+		resp.Error = NewJSRequiredApiLevelError()
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+	if hasJS, doErr := acc.checkJetStream(); !hasJS {
+		if doErr {
+			resp.Error = NewJSNotEnabledForAccountError()
+			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		}
+		return
+	}
+	if isEmptyRequest(msg) {
+		resp.Error = NewJSReadSnapshotBadRequestError()
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+	var req JSApiReadSnapshotReadRequest
+	if err := s.unmarshalRequest(c, acc, subject, msg, &req); err != nil {
+		resp.Error = NewJSInvalidJSONError(err)
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+	if req.SnapshotID == _EMPTY_ {
+		resp.Error = NewJSReadSnapshotBadRequestError()
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+
+	mset, err := acc.lookupStream(stream)
+	if err != nil {
+		resp.Error = NewJSStreamNotFoundError()
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+	if mset.offlineReason != _EMPTY_ {
+		return
+	}
+
+	_, _, _, maxBatch := mset.readSnapshotLimits()
+	if req.Batch <= 0 {
+		req.Batch = defaultReadSnapshotBatch
+	}
+	if req.Batch > maxBatch {
+		resp.Error = NewJSReadSnapshotBadRequestError()
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+	if req.MaxBytes == 0 {
+		// Default to something that fits the configured max payload.
+		req.MaxBytes = int64(s.getOpts().MaxPayload) - 4096
+		if req.MaxBytes < 1024 {
+			req.MaxBytes = 1024
+		}
+	}
+	if req.MaxBytes > maxReadSnapshotBatchBytes {
+		resp.Error = NewJSReadSnapshotBadRequestError()
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+
+	rs := mset.lookupReadSnapshot(req.SnapshotID)
+	if rs == nil {
+		resp.Error = NewJSReadSnapshotNotFoundError()
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+
+	msgs, next, remaining, complete, err := rs.ReadBatch(req.Cursor, req.Batch, req.MaxBytes)
+	if err != nil {
+		resp.Error = jsReadSnapshotStoreError(err)
+		resp.Snapshot = jsReadSnapshotInfo(stream, rs.State())
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+
+	resp.Cursor = next
+	resp.RemainingMessages = remaining
+	resp.Complete = complete
+	resp.Snapshot = jsReadSnapshotInfo(stream, rs.State())
+	if len(msgs) > 0 {
+		resp.Messages = make([]*StoredMsg, 0, len(msgs))
+		for _, sm := range msgs {
+			resp.Messages = append(resp.Messages, &StoredMsg{
+				Subject:  sm.subj,
+				Sequence: sm.seq,
+				Header:   sm.hdr,
+				Data:     sm.msg,
+				Time:     time.Unix(0, sm.ts).UTC(),
+			})
+		}
+	}
+	s.sendAPIResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+}
+
+func (s *Server) jsReadSnapshotInfoRequest(sub *subscription, c *client, _ *Account, subject, reply string, rmsg []byte) {
+	if c == nil || !s.JetStreamEnabled() {
+		return
+	}
+	ci, acc, hdr, msg, err := s.getRequestInfo(c, rmsg)
+	if err != nil {
+		s.Warnf(badAPIRequestT, msg)
+		return
+	}
+
+	stream := tokenAt(subject, 6)
+	resp := JSApiReadSnapshotInfoResponse{ApiResponse: ApiResponse{Type: JSApiReadSnapshotInfoResponseType}}
+
+	proceed, apiErr := s.readSnapshotGate(acc, stream)
+	if !proceed {
+		if apiErr != nil {
+			resp.Error = apiErr
+			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		}
+		return
+	}
+
+	if errorOnRequiredApiLevel(hdr) {
+		resp.Error = NewJSRequiredApiLevelError()
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+	if hasJS, doErr := acc.checkJetStream(); !hasJS {
+		if doErr {
+			resp.Error = NewJSNotEnabledForAccountError()
+			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		}
+		return
+	}
+	if isEmptyRequest(msg) {
+		resp.Error = NewJSReadSnapshotBadRequestError()
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+	var req JSApiReadSnapshotInfoRequest
+	if err := s.unmarshalRequest(c, acc, subject, msg, &req); err != nil {
+		resp.Error = NewJSInvalidJSONError(err)
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+	if req.SnapshotID == _EMPTY_ {
+		resp.Error = NewJSReadSnapshotBadRequestError()
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+
+	mset, err := acc.lookupStream(stream)
+	if err != nil {
+		resp.Error = NewJSStreamNotFoundError()
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+	if mset.offlineReason != _EMPTY_ {
+		return
+	}
+
+	rs := mset.lookupReadSnapshot(req.SnapshotID)
+	if rs == nil {
+		resp.Error = NewJSReadSnapshotNotFoundError()
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+	resp.Snapshot = jsReadSnapshotInfo(stream, rs.State())
+	s.sendAPIResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+}
+
+func (s *Server) jsReadSnapshotDeleteRequest(sub *subscription, c *client, _ *Account, subject, reply string, rmsg []byte) {
+	if c == nil || !s.JetStreamEnabled() {
+		return
+	}
+	ci, acc, hdr, msg, err := s.getRequestInfo(c, rmsg)
+	if err != nil {
+		s.Warnf(badAPIRequestT, msg)
+		return
+	}
+
+	stream := tokenAt(subject, 6)
+	resp := JSApiReadSnapshotDeleteResponse{ApiResponse: ApiResponse{Type: JSApiReadSnapshotDeleteResponseType}}
+
+	proceed, apiErr := s.readSnapshotGate(acc, stream)
+	if !proceed {
+		if apiErr != nil {
+			resp.Error = apiErr
+			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		}
+		return
+	}
+
+	if errorOnRequiredApiLevel(hdr) {
+		resp.Error = NewJSRequiredApiLevelError()
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+	if hasJS, doErr := acc.checkJetStream(); !hasJS {
+		if doErr {
+			resp.Error = NewJSNotEnabledForAccountError()
+			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		}
+		return
+	}
+	if isEmptyRequest(msg) {
+		resp.Error = NewJSReadSnapshotBadRequestError()
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+	var req JSApiReadSnapshotDeleteRequest
+	if err := s.unmarshalRequest(c, acc, subject, msg, &req); err != nil {
+		resp.Error = NewJSInvalidJSONError(err)
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+	if req.SnapshotID == _EMPTY_ {
+		resp.Error = NewJSReadSnapshotBadRequestError()
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+
+	mset, err := acc.lookupStream(stream)
+	if err != nil {
+		resp.Error = NewJSStreamNotFoundError()
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+	if mset.offlineReason != _EMPTY_ {
+		return
+	}
+
+	// Release is idempotent: releasing an unknown/released snapshot succeeds.
+	mset.releaseReadSnapshot(req.SnapshotID)
+	resp.Success = true
+	s.sendAPIResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+}
+
+func (s *Server) jsReadSnapshotListRequest(sub *subscription, c *client, _ *Account, subject, reply string, rmsg []byte) {
+	if c == nil || !s.JetStreamEnabled() {
+		return
+	}
+	ci, acc, hdr, msg, err := s.getRequestInfo(c, rmsg)
+	if err != nil {
+		s.Warnf(badAPIRequestT, msg)
+		return
+	}
+
+	stream := tokenAt(subject, 6)
+	resp := JSApiReadSnapshotListResponse{ApiResponse: ApiResponse{Type: JSApiReadSnapshotListResponseType}}
+
+	proceed, apiErr := s.readSnapshotGate(acc, stream)
+	if !proceed {
+		if apiErr != nil {
+			resp.Error = apiErr
+			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		}
+		return
+	}
+
+	if errorOnRequiredApiLevel(hdr) {
+		resp.Error = NewJSRequiredApiLevelError()
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+	if hasJS, doErr := acc.checkJetStream(); !hasJS {
+		if doErr {
+			resp.Error = NewJSNotEnabledForAccountError()
+			s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		}
+		return
+	}
+
+	mset, err := acc.lookupStream(stream)
+	if err != nil {
+		resp.Error = NewJSStreamNotFoundError()
+		s.sendAPIErrResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
+		return
+	}
+	if mset.offlineReason != _EMPTY_ {
+		return
+	}
+
+	for _, rs := range mset.listReadSnapshots() {
+		resp.Snapshots = append(resp.Snapshots, jsReadSnapshotInfo(stream, rs.State()))
+	}
+	resp.Total = len(resp.Snapshots)
+	s.sendAPIResponse(ci, acc, subject, reply, string(msg), s.jsonResponse(&resp))
 }
 
 func (s *Server) jsConsumerUnpinRequest(sub *subscription, c *client, _ *Account, subject, reply string, rmsg []byte) {

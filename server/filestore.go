@@ -224,6 +224,7 @@ type fileStore struct {
 	lpex        time.Time // Last PurgeEx call.
 	dios        *diskIOSemaphore
 	sources     map[string]*StreamSourceState
+	rsm         *readSnapshotManager
 }
 
 // Represents a message store block and its data.
@@ -465,6 +466,7 @@ func newFileStoreWithCreatedAndMode(fcfg FileStoreConfig, cfg StreamConfig, crea
 		srv:        fcfg.srv,
 		recovering: recovering,
 	}
+	fs.rsm = newReadSnapshotManager(fs)
 	fs.syncAlways.Store(fcfg.SyncAlways && !fcfg.SyncOnFlush)
 	fs.syncOnFlush.Store(fcfg.SyncOnFlush)
 
@@ -6224,6 +6226,10 @@ func (fs *fileStore) removeMsgFromBlock(mb *msgBlock, seq uint64, secure, viaLim
 		lhdr = len(sm.hdr)
 		lmsg = len(sm.msg)
 		ttl, _ = getMessageTTL(sm.hdr)
+		// Offer to read snapshots before tombstone/erase/dmap processing so
+		// their retained view survives this deletion. Best effort, bounded and
+		// never blocking: overflow invalidates the snapshot, not the delete.
+		fs.rsm.capture(seq, sm.subj, sm.hdr, sm.msg, sm.ts)
 	}
 
 	// Check if we need to write a deleted record tombstone.
@@ -10071,6 +10077,28 @@ func (fs *fileStore) ResetState() {
 	}
 }
 
+func (fs *fileStore) CreateReadSnapshot(cfg ReadSnapshotConfig) (*ReadSnapshot, error) {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	return fs.rsm.create(cfg, fs.state.FirstSeq, fs.state.LastSeq)
+}
+
+func (fs *fileStore) LookupReadSnapshot(id string) *ReadSnapshot {
+	return fs.rsm.lookup(id)
+}
+
+func (fs *fileStore) ListReadSnapshots() []*ReadSnapshot {
+	return fs.rsm.list()
+}
+
+func (fs *fileStore) ReleaseReadSnapshot(id string) bool {
+	return fs.rsm.release(id)
+}
+
+func (fs *fileStore) InvalidateReadSnapshots(reason string) {
+	fs.rsm.invalidateAll(reason)
+}
+
 func (fs *fileStore) Ready() {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
@@ -10608,6 +10636,9 @@ func (fs *fileStore) purgeLocked(fseq uint64) (purged, bytes uint64, err error) 
 		return 0, 0, err
 	}
 
+	// A wholesale purge cannot preserve any read view; invalidate snapshots.
+	fs.rsm.invalidateAll(ReadSnapshotReasonPurged)
+
 	purged, bytes = fs.state.Msgs, fs.state.Bytes
 
 	fs.state.FirstSeq = fs.state.LastSeq + 1
@@ -10833,6 +10864,11 @@ func (fs *fileStore) compactLocked(seq uint64) (purged, bytes uint64, err error)
 	if fs.state.FirstSeq > seq {
 		return 0, 0, nil
 	}
+
+	// Prefix blocks are dropped wholesale; invalidate active snapshots rather
+	// than retaining an unbounded prefix of data.
+	fs.rsm.invalidateAll(ReadSnapshotReasonCompacted)
+
 	// We have to delete interior messages.
 	smb := fs.selectMsgBlock(seq)
 	if smb == nil {
@@ -11090,6 +11126,8 @@ func (fs *fileStore) reset() error {
 	var purged, bytes uint64
 	cb := fs.scb
 
+	fs.rsm.invalidateAll(ReadSnapshotReasonTruncated)
+
 	for _, mb := range fs.blks {
 		mb.mu.Lock()
 		purged += mb.msgs
@@ -11260,6 +11298,11 @@ func (fs *fileStore) Truncate(seq uint64) (rerr error) {
 	// Any existing state file will no longer be applicable. We will force write a new one
 	// at the end, after we release the lock.
 	os.Remove(filepath.Join(fs.fcfg.StoreDir, msgDir, streamStreamStateFile))
+
+	// Truncation removes a suffix of the view; invalidate active snapshots.
+	if seq < fs.state.LastSeq {
+		fs.rsm.invalidateAll(ReadSnapshotReasonTruncated)
+	}
 
 	var hasLsm bool
 	var lastTime int64
@@ -11554,6 +11597,13 @@ func (fs *fileStore) forceRemoveMsgBlock(mb *msgBlock) error {
 // Lock should be held.
 func (fs *fileStore) purgeMsgBlock(mb *msgBlock, agg *storeUpdateAgg) error {
 	mb.mu.Lock()
+	// A whole block with live messages is about to disappear (limits eviction
+	// or range purge); per-record retention cannot cover that, so invalidate
+	// active snapshots. Empty blocks only held data that was already deleted
+	// (and therefore offered to snapshots individually), so leave them alone.
+	if mb.msgs > 0 {
+		fs.rsm.invalidateAll(ReadSnapshotReasonPurged)
+	}
 	// Adjust per-subject tracking if present.
 	if err := mb.ensurePerSubjectInfoLoaded(); err != nil {
 		mb.mu.Unlock()
@@ -12666,6 +12716,9 @@ func (fs *fileStore) stop(delete, writeState bool) error {
 	// Mark as closing. Do before releasing the lock to wait on the state flush loop
 	// so we don't end up with this function running more than once.
 	fs.closing = true
+
+	// Read snapshots are in-memory only; drop them on shutdown.
+	fs.rsm.close()
 
 	// Release the state flusher loop.
 	if fs.qch != nil {

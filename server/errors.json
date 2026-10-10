@@ -2258,5 +2258,55 @@
     "help": "",
     "url": "",
     "deprecates": ""
+  },
+  {
+    "constant": "JSReadSnapshotNotFoundErr",
+    "code": 404,
+    "error_code": 10228,
+    "description": "read snapshot not found",
+    "comment": "",
+    "help": "",
+    "url": "",
+    "deprecates": ""
+  },
+  {
+    "constant": "JSReadSnapshotInvalidErr",
+    "code": 409,
+    "error_code": 10229,
+    "description": "read snapshot invalid: {reason}",
+    "comment": "",
+    "help": "",
+    "url": "",
+    "deprecates": ""
+  },
+  {
+    "constant": "JSReadSnapshotLimitReachedErr",
+    "code": 403,
+    "error_code": 10230,
+    "description": "read snapshot limit reached",
+    "comment": "",
+    "help": "",
+    "url": "",
+    "deprecates": ""
+  },
+  {
+    "constant": "JSReadSnapshotBadRequestErr",
+    "code": 400,
+    "error_code": 10231,
+    "description": "read snapshot request invalid",
+    "comment": "",
+    "help": "",
+    "url": "",
+    "deprecates": ""
+  },
+  {
+    "constant": "JSReadSnapshotCursorMismatchErr",
+    "code": 409,
+    "error_code": 10232,
+    "description": "read snapshot cursor mismatch",
+    "comment": "",
+    "help": "",
+    "url": "",
+    "deprecates": ""
   }
 ]

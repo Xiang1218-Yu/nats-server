@@ -53,6 +53,7 @@ type memStore struct {
 	scheduling  *MsgScheduling
 	sdm         *SDMMeta
 	sources     map[string]*StreamSourceState
+	rsm         *readSnapshotManager
 }
 
 func newMemStore(cfg *StreamConfig) (*memStore, error) {
@@ -73,6 +74,7 @@ func newMemStoreWithMode(cfg *StreamConfig, recovering bool) (*memStore, error) 
 		cfg:        *cfg,
 		recovering: recovering,
 	}
+	ms.rsm = newReadSnapshotManager(ms)
 	// Only create a THW if we're going to allow TTLs.
 	if cfg.AllowMsgTTL {
 		ms.ttls = thw.NewHashWheel()
@@ -1668,6 +1670,8 @@ func (ms *memStore) purge(fseq uint64) (uint64, error) {
 	purged := uint64(len(ms.msgs))
 	cb := ms.scb
 	bytes := int64(ms.state.Bytes)
+	// Wholesale purge cannot preserve a bounded read view; invalidate snapshots.
+	ms.rsm.invalidateAll(ReadSnapshotReasonPurged)
 	if fseq == 0 {
 		fseq = ms.state.LastSeq + 1
 	} else if fseq < ms.state.LastSeq {
@@ -1714,6 +1718,10 @@ func (ms *memStore) compact(seq uint64) (uint64, error) {
 		ms.mu.Unlock()
 		return purged, nil
 	}
+
+	// Compaction drops a prefix wholesale; any active snapshot loses part of
+	// its view, so invalidate rather than retain an unbounded prefix.
+	ms.rsm.invalidateAll(ReadSnapshotReasonCompacted)
 
 	cb := ms.scb
 	if seq <= ms.state.LastSeq {
@@ -1779,6 +1787,7 @@ func (ms *memStore) reset() error {
 	ms.mu.Lock()
 	var purged, bytes uint64
 	cb := ms.scb
+	ms.rsm.invalidateAll(ReadSnapshotReasonTruncated)
 	if cb != nil {
 		for _, sm := range ms.msgs {
 			purged++
@@ -1823,6 +1832,11 @@ func (ms *memStore) Truncate(seq uint64) error {
 	lastTime := ms.state.LastTime
 	if ok && lsm != nil {
 		lastTime = time.Unix(0, lsm.ts).UTC()
+	}
+
+	// Truncation removes a suffix of the view; invalidate active snapshots.
+	if seq < ms.state.LastSeq {
+		ms.rsm.invalidateAll(ReadSnapshotReasonTruncated)
 	}
 
 	for i := ms.state.LastSeq; i > seq; i-- {
@@ -2408,6 +2422,11 @@ func (ms *memStore) removeMsgNoCB(seq uint64, secure bool) (subj string, size ui
 		return _EMPTY_, 0, false
 	}
 
+	// Offer to read snapshots before any secure wipe or map removal so their
+	// retained view of this message survives the deletion. Best effort and
+	// bounded: it never fails or blocks the deletion.
+	ms.rsm.capture(seq, sm.subj, sm.hdr, sm.msg, sm.ts)
+
 	size = memStoreMsgSize(sm.subj, sm.hdr, sm.msg)
 
 	if ms.state.Msgs > 0 {
@@ -2557,6 +2576,8 @@ func (ms *memStore) Stop() error {
 		ms.mu.Unlock()
 		return nil
 	}
+	// Read snapshots are in-memory only; drop them on shutdown.
+	ms.rsm.close()
 	if ms.ageChk != nil {
 		ms.ageChk.Stop()
 		ms.ageChk = nil
@@ -2578,6 +2599,28 @@ func (ms *memStore) isClosed() bool {
 	ms.mu.RLock()
 	defer ms.mu.RUnlock()
 	return ms.msgs == nil
+}
+
+func (ms *memStore) CreateReadSnapshot(cfg ReadSnapshotConfig) (*ReadSnapshot, error) {
+	ms.mu.Lock()
+	defer ms.mu.Unlock()
+	return ms.rsm.create(cfg, ms.state.FirstSeq, ms.state.LastSeq)
+}
+
+func (ms *memStore) LookupReadSnapshot(id string) *ReadSnapshot {
+	return ms.rsm.lookup(id)
+}
+
+func (ms *memStore) ListReadSnapshots() []*ReadSnapshot {
+	return ms.rsm.list()
+}
+
+func (ms *memStore) ReleaseReadSnapshot(id string) bool {
+	return ms.rsm.release(id)
+}
+
+func (ms *memStore) InvalidateReadSnapshots(reason string) {
+	ms.rsm.invalidateAll(reason)
 }
 
 type consumerMemStore struct {

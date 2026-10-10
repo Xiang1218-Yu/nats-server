@@ -69,7 +69,78 @@ var (
 	ErrTooManyResults = errors.New("too many matching results for request")
 	// ErrStoreOldUpdate is returned when a consumer update is older than the current state.
 	ErrStoreOldUpdate = errors.New("old update ignored")
+	// ErrReadSnapshotNotFound is returned when an unknown or released read snapshot is referenced.
+	ErrReadSnapshotNotFound = errors.New("read snapshot not found")
+	// ErrReadSnapshotCursor is returned when a read request provides a cursor that
+	// does not match the snapshot's server-side cursor.
+	ErrReadSnapshotCursor = errors.New("read snapshot cursor mismatch")
+	// ErrReadSnapshotBadRange is returned when a requested sequence range is invalid
+	// for the current stream state.
+	ErrReadSnapshotBadRange = errors.New("read snapshot sequence range invalid")
+	// ErrReadSnapshotLimit is returned when the per-stream read snapshot limit is reached.
+	ErrReadSnapshotLimit = errors.New("read snapshot limit reached")
 )
+
+// Read snapshot statuses reported through ReadSnapshotState and the API.
+const (
+	ReadSnapshotActive      = "active"
+	ReadSnapshotComplete    = "complete"
+	ReadSnapshotInvalidated = "invalidated"
+)
+
+// Read snapshot invalidation reasons.
+const (
+	ReadSnapshotReasonExpired        = "expired"
+	ReadSnapshotReasonSpaceLimit     = "space_limit"
+	ReadSnapshotReasonPurged         = "purged"
+	ReadSnapshotReasonCompacted      = "compacted"
+	ReadSnapshotReasonTruncated      = "truncated"
+	ReadSnapshotReasonLeadershipLost = "leadership_lost"
+	ReadSnapshotReasonStoreStopped   = "store_stopped"
+)
+
+// ReadSnapshotConfig configures a short lived consistent read snapshot.
+// Zero StartSeq/EndSeq resolve to the store's current FirstSeq/LastSeq.
+type ReadSnapshotConfig struct {
+	ID       string
+	Filter   string
+	StartSeq uint64
+	EndSeq   uint64
+	TTL      time.Duration
+	MaxBytes int64
+	MaxSnaps int
+}
+
+// ReadSnapshotState is an observable snapshot of a ReadSnapshot's state.
+type ReadSnapshotState struct {
+	ID            string
+	Status        string
+	Reason        string
+	Filter        string
+	StartSeq      uint64
+	EndSeq        uint64
+	Cursor        uint64
+	RemainingMsgs uint64
+	RetainedMsgs  int
+	RetainedBytes int64
+	MaxBytes      int64
+	Created       time.Time
+	Expires       time.Time
+}
+
+// ReadSnapshotInvalidError is returned from snapshot reads once the snapshot has
+// been invalidated (expiry, space limit, purge, compaction, truncation,
+// leadership loss or store shutdown).
+type ReadSnapshotInvalidError struct {
+	Reason string
+}
+
+func (e *ReadSnapshotInvalidError) Error() string {
+	if e == nil || e.Reason == _EMPTY_ {
+		return "read snapshot invalid"
+	}
+	return "read snapshot invalid: " + e.Reason
+}
 
 // StoreMsg is the stored message format for messages that are retained by the Store layer.
 type StoreMsg struct {
@@ -140,6 +211,11 @@ type StreamStore interface {
 	RemoveConsumer(o ConsumerStore) error
 	Consumers() iter.Seq[ConsumerStore]
 	Snapshot(deadline time.Duration, includeConsumers, checkMsgs bool) (*SnapshotResult, error)
+	CreateReadSnapshot(cfg ReadSnapshotConfig) (*ReadSnapshot, error)
+	LookupReadSnapshot(id string) *ReadSnapshot
+	ListReadSnapshots() []*ReadSnapshot
+	ReleaseReadSnapshot(id string) bool
+	InvalidateReadSnapshots(reason string)
 	Utilization() (total, reported uint64, err error)
 	ResetState()
 }

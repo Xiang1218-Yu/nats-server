@@ -1446,6 +1446,12 @@ func (mset *stream) setLeader(isLeader bool, term uint64) error {
 		// Unsubscribe from direct stream.
 		mset.unsubscribeToStream(false, false)
 		mset.store.ResetState()
+		// Read snapshots are leader local, in-memory state; demotion invalidates
+		// them so readers get an explicit leadership_lost error instead of a
+		// silent timeout.
+		if !isLeader {
+			mset.store.InvalidateReadSnapshots(ReadSnapshotReasonLeadershipLost)
+		}
 	}
 
 	// If we are here we have a change in leader status.
@@ -3246,6 +3252,71 @@ func (mset *stream) eraseMsg(seq uint64) (bool, error) {
 	mset.clearAllPreAcks(seq)
 	mset.mu.Unlock()
 	return removed, err
+}
+
+// readSnapshotLimits resolves the effective server side limits for read
+// snapshots, applying built-in defaults and hard caps.
+func (mset *stream) readSnapshotLimits() (maxSnaps int, maxTTL time.Duration, maxBytes int64, maxBatch int) {
+	opts := mset.srv.getOpts().JetStreamLimits
+	maxSnaps = defaultMaxReadSnapshots
+	if opts.MaxReadSnapshots > 0 {
+		maxSnaps = opts.MaxReadSnapshots
+	}
+	maxTTL = defaultReadSnapshotTTL
+	if opts.MaxReadSnapshotTTL > 0 {
+		maxTTL = opts.MaxReadSnapshotTTL
+	}
+	if maxTTL > maxReadSnapshotTTL {
+		maxTTL = maxReadSnapshotTTL
+	}
+	maxBytes = defaultMaxReadSnapshotBytes
+	if opts.MaxReadSnapshotBytes > 0 {
+		maxBytes = opts.MaxReadSnapshotBytes
+	}
+	maxBatch = defaultReadSnapshotBatch
+	if opts.MaxReadSnapshotBatch > 0 {
+		maxBatch = opts.MaxReadSnapshotBatch
+	}
+	if maxBatch > maxReadSnapshotBatch {
+		maxBatch = maxReadSnapshotBatch
+	}
+	return maxSnaps, maxTTL, maxBytes, maxBatch
+}
+
+// createReadSnapshot validates the request against server limits and creates a
+// store backed consistent read snapshot. Reads fence the snapshot against
+// interleaving writes/purges via isolateMu like MSG.GET.
+func (mset *stream) createReadSnapshot(cfg ReadSnapshotConfig) (*ReadSnapshot, error) {
+	maxSnaps, maxTTL, maxBytes, _ := mset.readSnapshotLimits()
+
+	if cfg.TTL <= 0 {
+		cfg.TTL = defaultReadSnapshotTTL
+	}
+	if cfg.TTL > maxTTL {
+		return nil, fmt.Errorf("read snapshot ttl %s exceeds server limit %s", cfg.TTL, maxTTL)
+	}
+	if cfg.MaxBytes <= 0 {
+		cfg.MaxBytes = maxBytes
+	} else if cfg.MaxBytes > maxBytes {
+		return nil, fmt.Errorf("read snapshot max_bytes %d exceeds server limit %d", cfg.MaxBytes, maxBytes)
+	}
+	cfg.MaxSnaps = maxSnaps
+
+	mset.isolateMu.RLock()
+	defer mset.isolateMu.RUnlock()
+	return mset.store.CreateReadSnapshot(cfg)
+}
+
+func (mset *stream) lookupReadSnapshot(id string) *ReadSnapshot {
+	return mset.store.LookupReadSnapshot(id)
+}
+
+func (mset *stream) listReadSnapshots() []*ReadSnapshot {
+	return mset.store.ListReadSnapshots()
+}
+
+func (mset *stream) releaseReadSnapshot(id string) bool {
+	return mset.store.ReleaseReadSnapshot(id)
 }
 
 // Are we a mirror?
